@@ -4,6 +4,7 @@
 
 use crate::palette::Palette;
 
+mod cycle;
 mod flow;
 mod gradient;
 mod reactive;
@@ -11,6 +12,7 @@ mod ripple;
 mod sparkle;
 mod vortex;
 
+pub use cycle::Effect;
 pub use flow::FlowState;
 pub use gradient::gradient;
 pub use reactive::{Hit, ReactiveState};
