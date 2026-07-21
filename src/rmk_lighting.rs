@@ -21,10 +21,59 @@ use rmk::lighting::compositor::{Contribution, LightingSource, RenderInput};
 use rmk::lighting::{EffectSample, LedSlot, Rgb8};
 use rmk::types::action::LightAction;
 
+use rmk::lighting::topology::LightingTopology;
+
 use crate::color::{Hsv, hsv_to_rgb};
 use crate::effects::{Effect, FrameParams};
 use crate::layout::LedLayout;
 use crate::palette::BUILTIN_PALETTES;
+
+/// [`LedLayout`] derived from an RMK lighting topology, so boards that
+/// declare emitter geometry in `keyboard.toml` need no hand-written LED
+/// position table. Each slot takes its effective position (explicit emitter
+/// position, else the key center), normalised to the 0..=255 effect grid.
+/// Both axes share one scale factor so polar effects stay isotropic.
+pub struct TopologyLayout<const N: usize> {
+    positions: [(u8, u8); N],
+}
+
+impl<const N: usize> TopologyLayout<N> {
+    pub fn new(topology: &LightingTopology<'_>) -> Self {
+        let mut raw = [(0i32, 0i32); N];
+        let (mut min_x, mut min_y) = (i32::MAX, i32::MAX);
+        let (mut max_x, mut max_y) = (i32::MIN, i32::MIN);
+        for (slot, entry) in raw.iter_mut().enumerate() {
+            let (x, y) = topology
+                .effective_position(LedSlot(slot as u16))
+                .map(|p| (p.x.raw() as i32, p.y.raw() as i32))
+                .unwrap_or((0, 0));
+            *entry = (x, y);
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+        let span = (max_x - min_x).max(max_y - min_y).max(1);
+        let mut positions = [(0u8, 0u8); N];
+        for (slot, &(x, y)) in raw.iter().enumerate() {
+            positions[slot] = (
+                ((x - min_x) * 255 / span) as u8,
+                ((y - min_y) * 255 / span) as u8,
+            );
+        }
+        Self { positions }
+    }
+}
+
+impl<const N: usize> LedLayout for TopologyLayout<N> {
+    fn count(&self) -> usize {
+        N
+    }
+
+    fn position(&self, index: usize) -> (u8, u8) {
+        self.positions[index]
+    }
+}
 
 /// Runtime tuning for a [`PaletteFxSource`]. `Default` matches PaletteFx's
 /// QMK defaults; boards usually override `initial_val` for their hardware.
