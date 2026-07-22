@@ -78,9 +78,12 @@ impl<const N: usize> LedLayout for TopologyLayout<N> {
 }
 
 /// Runtime tuning for a [`PaletteFxSource`]. `Default` matches PaletteFx's
-/// QMK defaults; boards usually override `initial_val` for their hardware.
+/// QMK defaults; boards usually override the initial state for their hardware.
 #[derive(Copy, Clone, Debug)]
 pub struct PaletteFxConfig {
+    /// Whether the effect source starts enabled. A disabled source remembers
+    /// `initial_val` as the value restored by `RgbTog`.
+    pub initial_enabled: bool,
     /// Initial brightness (`FrameParams::val`), adjusted by RgbVai/RgbVad.
     pub initial_val: u8,
     /// Brightness floor for RgbVad.
@@ -100,6 +103,7 @@ pub struct PaletteFxConfig {
 impl Default for PaletteFxConfig {
     fn default() -> Self {
         Self {
+            initial_enabled: true,
             initial_val: 255,
             min_val: 8,
             val_step: 16,
@@ -146,6 +150,7 @@ pub struct PaletteFxSource<L: LedLayout, const N: usize, const HITS: usize = 16>
     effect: Effect<HITS>,
     palette_idx: usize,
     val: u8,
+    last_nonzero_val: u8,
     speed: u8,
     frame: [Hsv; N],
     last_now_ms: u64,
@@ -156,12 +161,22 @@ impl<L: LedLayout, const N: usize, const HITS: usize> PaletteFxSource<L, N, HITS
         let mut effect = Effect::Gradient;
         // Boot into Flow: an animated default shows the system is alive.
         effect.next(0);
+        let last_nonzero_val = if config.initial_val == 0 {
+            config.min_val.max(1)
+        } else {
+            config.initial_val
+        };
         Self {
             layout,
             hits,
             effect,
             palette_idx: config.initial_palette,
-            val: config.initial_val,
+            val: if config.initial_enabled {
+                config.initial_val
+            } else {
+                0
+            },
+            last_nonzero_val,
             speed: config.initial_speed,
             config,
             frame: [Hsv::default(); N],
@@ -225,16 +240,30 @@ impl<L: LedLayout, const N: usize, const HITS: usize, Context> LightingSource<Rg
     fn handle_light_action(&mut self, action: LightAction) -> bool {
         let n = BUILTIN_PALETTES.len();
         match action {
+            LightAction::RgbTog => {
+                if self.val == 0 {
+                    self.val = self.last_nonzero_val;
+                } else {
+                    self.last_nonzero_val = self.val;
+                    self.val = 0;
+                }
+            }
             LightAction::RgbModeForward => self.effect.next(self.ripple_seed()),
             LightAction::RgbModeReverse => self.effect.prev(self.ripple_seed()),
             LightAction::RgbHui => self.palette_idx = (self.palette_idx + 1) % n,
             LightAction::RgbHud => self.palette_idx = (self.palette_idx + n - 1) % n,
-            LightAction::RgbVai => self.val = self.val.saturating_add(self.config.val_step),
+            LightAction::RgbVai => {
+                self.val = self.val.saturating_add(self.config.val_step);
+                self.last_nonzero_val = self.val.max(self.config.min_val.max(1));
+            }
             LightAction::RgbVad => {
                 self.val = self
                     .val
                     .saturating_sub(self.config.val_step)
-                    .max(self.config.min_val)
+                    .max(self.config.min_val);
+                if self.val != 0 {
+                    self.last_nonzero_val = self.val;
+                }
             }
             LightAction::RgbSpi => self.speed = self.speed.saturating_add(self.config.speed_step),
             LightAction::RgbSpd => self.speed = self.speed.saturating_sub(self.config.speed_step),
@@ -273,6 +302,9 @@ impl<L: LedLayout, const N: usize, const HITS: usize, Context> LightingSource<Rg
         }
         self.palette_idx = state.palette as usize;
         self.val = state.value;
+        if state.value != 0 {
+            self.last_nonzero_val = state.value;
+        }
         self.speed = state.speed;
         true
     }
@@ -310,5 +342,68 @@ mod tests {
         hit.tick_frame(60_000);
 
         assert_ne!(hit.frame, baseline.frame);
+    }
+
+    #[test]
+    fn rgb_toggle_turns_effects_off_and_restores_the_previous_value() {
+        let mut source = reactive(&NO_HITS);
+
+        assert!(
+            <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::handle_light_action(
+                &mut source,
+                LightAction::RgbTog,
+            )
+        );
+        assert_eq!(
+            <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::extension_state(&source)
+                .unwrap()
+                .value,
+            0
+        );
+
+        assert!(
+            <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::handle_light_action(
+                &mut source,
+                LightAction::RgbTog,
+            )
+        );
+        assert_eq!(
+            <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::extension_state(&source)
+                .unwrap()
+                .value,
+            255
+        );
+    }
+
+    #[test]
+    fn disabled_initial_state_toggles_on_at_the_configured_value() {
+        let mut source = PaletteFxSource::new(
+            SliceLayout::new(&POSITIONS),
+            &NO_HITS,
+            PaletteFxConfig {
+                initial_enabled: false,
+                initial_val: 128,
+                ..PaletteFxConfig::default()
+            },
+        );
+
+        assert_eq!(
+            <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::extension_state(&source)
+                .unwrap()
+                .value,
+            0
+        );
+        assert!(
+            <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::handle_light_action(
+                &mut source,
+                LightAction::RgbTog,
+            )
+        );
+        assert_eq!(
+            <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::extension_state(&source)
+                .unwrap()
+                .value,
+            128
+        );
     }
 }
