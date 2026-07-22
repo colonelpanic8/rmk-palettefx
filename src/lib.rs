@@ -64,4 +64,6 @@ pub mod effects;
 pub mod layout;
 pub mod math;
 pub mod palette;
+#[cfg(feature = "rmk-lighting")]
+pub mod rmk_lighting;
 pub mod time;
