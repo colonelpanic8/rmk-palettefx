@@ -877,7 +877,7 @@ dependencies = [
 [[package]]
 name = "rmk"
 version = "0.8.2"
-source = "git+https://github.com/colonelpanic8/rmk?branch=master#e5c1aed8fe4277bfac05e9c0a338eb641d18e8e3"
+source = "git+https://github.com/colonelpanic8/rmk?branch=master#ea4b13329a5737575cfef4d7c38480ba880f5196"
 dependencies = [
  "cortex-m",
  "crc32fast",
@@ -904,7 +904,7 @@ dependencies = [
 [[package]]
 name = "rmk-config"
 version = "0.6.1"
-source = "git+https://github.com/colonelpanic8/rmk?branch=master#e5c1aed8fe4277bfac05e9c0a338eb641d18e8e3"
+source = "git+https://github.com/colonelpanic8/rmk?branch=master#ea4b13329a5737575cfef4d7c38480ba880f5196"
 dependencies = [
  "config",
  "miniz_oxide",
@@ -921,7 +921,7 @@ dependencies = [
 [[package]]
 name = "rmk-macro"
 version = "0.7.1"
-source = "git+https://github.com/colonelpanic8/rmk?branch=master#e5c1aed8fe4277bfac05e9c0a338eb641d18e8e3"
+source = "git+https://github.com/colonelpanic8/rmk?branch=master#ea4b13329a5737575cfef4d7c38480ba880f5196"
 dependencies = [
  "cargo_toml",
  "darling",
@@ -951,7 +951,7 @@ dependencies = [
 [[package]]
 name = "rmk-types"
 version = "0.2.2"
-source = "git+https://github.com/colonelpanic8/rmk?branch=master#e5c1aed8fe4277bfac05e9c0a338eb641d18e8e3"
+source = "git+https://github.com/colonelpanic8/rmk?branch=master#ea4b13329a5737575cfef4d7c38480ba880f5196"
 dependencies = [
  "bitfield-struct",
  "heapless 0.9.3",
