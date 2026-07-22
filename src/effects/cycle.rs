@@ -25,6 +25,36 @@ pub enum Effect<const HITS: usize> {
 }
 
 impl<const HITS: usize> Effect<HITS> {
+    /// Display names in stable index order; `index`/`from_index` and the
+    /// next/prev cycle all agree with this ordering.
+    pub const NAMES: [&'static str; 6] = ["Gradient", "Flow", "Vortex", "Sparkle", "Ripple", "Reactive"];
+
+    /// Stable index of the active effect into [`Self::NAMES`].
+    pub const fn index(&self) -> u8 {
+        match self {
+            Self::Gradient => 0,
+            Self::Flow(_) => 1,
+            Self::Vortex(_) => 2,
+            Self::Sparkle(_) => 3,
+            Self::Ripple(_, _) => 4,
+            Self::Reactive(_) => 5,
+        }
+    }
+
+    /// Fresh effect state for a stable index, or `None` when out of range.
+    /// `ripple_seed` seeds Ripple's drop-placement RNG (see [`Self::next`]).
+    pub fn from_index(index: u8, ripple_seed: u64) -> Option<Self> {
+        Some(match index {
+            0 => Self::Gradient,
+            1 => Self::Flow(FlowState::new()),
+            2 => Self::Vortex(VortexState::new()),
+            3 => Self::Sparkle(SparkleState::new()),
+            4 => Self::Ripple(RippleState::new(), ripple_rng(ripple_seed)),
+            5 => Self::Reactive(ReactiveState::new()),
+            _ => return None,
+        })
+    }
+
     /// Render one frame of the active effect into `out`.
     pub fn tick<L: LedLayout>(&mut self, layout: &L, params: FrameParams<'_>, out: &mut [Hsv]) {
         match self {

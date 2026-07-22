@@ -17,7 +17,9 @@ use core::cell::RefCell;
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use heapless::Deque;
-use rmk::lighting::compositor::{Contribution, LightingSource, RenderInput};
+use rmk::lighting::compositor::{
+    Contribution, ExtensionDescriptor, ExtensionState, LightingSource, RenderInput,
+};
 use rmk::lighting::{EffectSample, LedSlot, Rgb8};
 use rmk::types::action::LightAction;
 
@@ -26,7 +28,7 @@ use rmk::lighting::topology::LightingTopology;
 use crate::color::{Hsv, hsv_to_rgb};
 use crate::effects::{Effect, FrameParams};
 use crate::layout::LedLayout;
-use crate::palette::BUILTIN_PALETTES;
+use crate::palette::{BUILTIN_PALETTE_NAMES, BUILTIN_PALETTES};
 
 /// [`LedLayout`] derived from an RMK lighting topology, so boards that
 /// declare emitter geometry in `keyboard.toml` need no hand-written LED
@@ -229,6 +231,40 @@ impl<L: LedLayout, const N: usize, const HITS: usize, Context> LightingSource<Rg
             LightAction::RgbSpd => self.speed = self.speed.saturating_sub(self.config.speed_step),
             _ => return false,
         }
+        true
+    }
+
+    fn extension_descriptor(&self) -> Option<ExtensionDescriptor> {
+        Some(ExtensionDescriptor {
+            effects: &Effect::<HITS>::NAMES,
+            palettes: &BUILTIN_PALETTE_NAMES,
+        })
+    }
+
+    fn extension_state(&self) -> Option<ExtensionState> {
+        Some(ExtensionState {
+            effect: self.effect.index(),
+            palette: self.palette_idx as u8,
+            value: self.val,
+            speed: self.speed,
+        })
+    }
+
+    fn apply_extension_state(&mut self, state: ExtensionState) -> bool {
+        if (state.palette as usize) >= BUILTIN_PALETTES.len() {
+            return false;
+        }
+        // Switching to the already-active effect keeps its animation state;
+        // hosts re-sending the current selection must not reset the phase.
+        if state.effect != self.effect.index() {
+            let Some(effect) = Effect::from_index(state.effect, self.ripple_seed()) else {
+                return false;
+            };
+            self.effect = effect;
+        }
+        self.palette_idx = state.palette as usize;
+        self.val = state.value;
+        self.speed = state.speed;
         true
     }
 }
