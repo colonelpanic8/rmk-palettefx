@@ -937,6 +937,7 @@ dependencies = [
 name = "rmk-palettefx"
 version = "0.1.0"
 dependencies = [
+ "critical-section",
  "embassy-sync",
  "heapless 0.9.3",
  "micromath",

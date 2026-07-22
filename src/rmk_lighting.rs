@@ -9,8 +9,8 @@
 //! background, so `light!(RgbModeForward)`-style keys drive the effects.
 //!
 //! Reactive key hits arrive through a board-owned [`HitQueue`] static: an
-//! event task records `(led, timer_ms)` pairs and the source drains them on
-//! the next frame tick.
+//! event task records LED indices and the source timestamps them in its own
+//! animation-clock domain when it drains them on the next frame tick.
 
 use core::cell::RefCell;
 
@@ -111,10 +111,10 @@ impl Default for PaletteFxConfig {
     }
 }
 
-/// Pending Reactive key hits: `(led index, timer_ms)`. `HITS` bounds how
-/// many un-drained presses are remembered between frames.
+/// Pending Reactive key-hit LED indices. `HITS` bounds how many un-drained
+/// presses are remembered between frames.
 pub struct HitQueue<const HITS: usize> {
-    hits: BlockingMutex<CriticalSectionRawMutex, RefCell<Deque<(u8, u32), HITS>>>,
+    hits: BlockingMutex<CriticalSectionRawMutex, RefCell<Deque<u8, HITS>>>,
 }
 
 impl<const HITS: usize> HitQueue<HITS> {
@@ -126,8 +126,9 @@ impl<const HITS: usize> HitQueue<HITS> {
 
     /// Record a key press. Returns `true` if the hit was queued (queue not
     /// full), so callers can skip requesting a render otherwise.
-    pub fn record(&self, led_idx: u8, timer_ms: u32) -> bool {
-        self.hits.lock(|hits| hits.borrow_mut().push_back((led_idx, timer_ms)).is_ok())
+    pub fn record(&self, led_idx: u8) -> bool {
+        self.hits
+            .lock(|hits| hits.borrow_mut().push_back(led_idx).is_ok())
     }
 }
 
@@ -172,8 +173,9 @@ impl<L: LedLayout, const N: usize, const HITS: usize> PaletteFxSource<L, N, HITS
         self.last_now_ms = now_ms;
         self.hits.hits.lock(|hits| {
             let mut hits = hits.borrow_mut();
-            while let Some((led, timer_ms)) = hits.pop_front() {
-                self.effect.record_hit(&self.layout, led as usize, timer_ms);
+            while let Some(led) = hits.pop_front() {
+                self.effect
+                    .record_hit(&self.layout, led as usize, now_ms as u32);
             }
         });
         self.effect.tick(
@@ -205,7 +207,11 @@ impl<L: LedLayout, const N: usize, const HITS: usize, Context> LightingSource<Rg
         LedSlot(index as u16)
     }
 
-    fn contribution(&mut self, index: usize, input: &RenderInput<'_, Context>) -> Contribution<Rgb8> {
+    fn contribution(
+        &mut self,
+        index: usize,
+        input: &RenderInput<'_, Context>,
+    ) -> Contribution<Rgb8> {
         if index == 0 {
             self.tick_frame(input.now_ms);
         }
@@ -225,7 +231,10 @@ impl<L: LedLayout, const N: usize, const HITS: usize, Context> LightingSource<Rg
             LightAction::RgbHud => self.palette_idx = (self.palette_idx + n - 1) % n,
             LightAction::RgbVai => self.val = self.val.saturating_add(self.config.val_step),
             LightAction::RgbVad => {
-                self.val = self.val.saturating_sub(self.config.val_step).max(self.config.min_val)
+                self.val = self
+                    .val
+                    .saturating_sub(self.config.val_step)
+                    .max(self.config.min_val)
             }
             LightAction::RgbSpi => self.speed = self.speed.saturating_add(self.config.speed_step),
             LightAction::RgbSpd => self.speed = self.speed.saturating_sub(self.config.speed_step),
@@ -266,5 +275,40 @@ impl<L: LedLayout, const N: usize, const HITS: usize, Context> LightingSource<Rg
         self.val = state.value;
         self.speed = state.speed;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::SliceLayout;
+
+    static HITS: HitQueue<1> = HitQueue::new();
+    static NO_HITS: HitQueue<1> = HitQueue::new();
+    static POSITIONS: [(u8, u8); 1] = [(128, 128)];
+
+    fn reactive(hits: &'static HitQueue<1>) -> PaletteFxSource<SliceLayout<'static>, 1, 1> {
+        let mut source = PaletteFxSource::new(
+            SliceLayout::new(&POSITIONS),
+            hits,
+            PaletteFxConfig {
+                initial_val: 255,
+                ..PaletteFxConfig::default()
+            },
+        );
+        source.effect = Effect::from_index(5, 0).unwrap();
+        source
+    }
+
+    #[test]
+    fn queued_hits_are_timestamped_in_the_render_clock_domain() {
+        let mut baseline = reactive(&NO_HITS);
+        baseline.tick_frame(60_000);
+
+        let mut hit = reactive(&HITS);
+        assert!(HITS.record(0));
+        hit.tick_frame(60_000);
+
+        assert_ne!(hit.frame, baseline.frame);
     }
 }

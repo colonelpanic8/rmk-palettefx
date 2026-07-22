@@ -27,7 +27,9 @@ pub enum Effect<const HITS: usize> {
 impl<const HITS: usize> Effect<HITS> {
     /// Display names in stable index order; `index`/`from_index` and the
     /// next/prev cycle all agree with this ordering.
-    pub const NAMES: [&'static str; 6] = ["Gradient", "Flow", "Vortex", "Sparkle", "Ripple", "Reactive"];
+    pub const NAMES: [&'static str; 6] = [
+        "Gradient", "Flow", "Vortex", "Sparkle", "Ripple", "Reactive",
+    ];
 
     /// Stable index of the active effect into [`Self::NAMES`].
     pub const fn index(&self) -> u8 {
