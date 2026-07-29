@@ -97,10 +97,22 @@ pub struct PaletteFxConfig {
     pub speed_step: u8,
     /// Index into [`BUILTIN_PALETTES`] to start on.
     pub initial_palette: usize,
-    /// Index into [`Effect::NAMES`] to boot into. Nothing persists the live
-    /// selection across a power cycle, so this is what the board comes up
-    /// with every time. Out-of-range values fall back to Flow.
+    /// Index into [`Effect::NAMES`] to boot into. Out-of-range values fall
+    /// back to Flow. A board that persists the live selection restores it
+    /// here, so this is the boot selection whether it came from flash or
+    /// from the board's compiled-in choice.
     pub initial_effect: u8,
+    /// Parameter values for `initial_effect`, in advertised index order, as
+    /// restored from persistent storage. Only the first `initial_param_len`
+    /// entries are read.
+    ///
+    /// Each value is applied through the same bounds check a host set uses,
+    /// so a record written by a firmware whose parameter list has since
+    /// changed contributes only the values that are still valid instead of
+    /// corrupting the effect.
+    pub initial_params: [u8; MAX_INITIAL_PARAMS],
+    /// Valid entries in `initial_params`; 0 means "use each default".
+    pub initial_param_len: u8,
     /// Frame cadence in milliseconds (40 ≈ 25 fps).
     pub frame_interval_ms: u64,
 }
@@ -117,10 +129,16 @@ impl Default for PaletteFxConfig {
             initial_palette: 0,
             // An animated default shows the system is alive.
             initial_effect: Effect::<1>::FLOW_INDEX,
+            initial_params: [0; MAX_INITIAL_PARAMS],
+            initial_param_len: 0,
             frame_interval_ms: 40,
         }
     }
 }
+
+/// Most parameters a board can restore at construction. Matches the chunk the
+/// rynk protocol pages parameters in, which bounds any persisted record.
+pub const MAX_INITIAL_PARAMS: usize = 8;
 
 /// Number of effects in the cycle; sizes the per-effect parameter tables.
 /// `Effect::NAMES` is the same list for every `HITS`, so the smallest
@@ -220,7 +238,24 @@ impl<L: LedLayout, const N: usize, const HITS: usize> PaletteFxSource<L, N, HITS
         } else {
             config.initial_val
         };
-        Self {
+
+        // Seed the restored tuning into the row for the effect it belongs to.
+        // `RainParams::set` rejects each out-of-range value on its own, so a
+        // stale record degrades parameter by parameter rather than wholesale.
+        let mut rain_params = [RainParams::DEFAULT; EFFECT_COUNT];
+        if Effect::<HITS>::uses_rain_params(config.initial_effect)
+            && let Some(row) = rain_params.get_mut(config.initial_effect as usize)
+        {
+            let restored = config
+                .initial_params
+                .iter()
+                .take(config.initial_param_len as usize);
+            for (index, &value) in restored.enumerate() {
+                row.set(index as u8, value);
+            }
+        }
+
+        let mut source = Self {
             layout,
             hits,
             effect,
@@ -233,10 +268,12 @@ impl<L: LedLayout, const N: usize, const HITS: usize> PaletteFxSource<L, N, HITS
             last_nonzero_val,
             speed: config.initial_speed,
             config,
-            rain_params: [RainParams::DEFAULT; EFFECT_COUNT],
+            rain_params,
             frame: [Hsv::default(); N],
             last_now_ms: 0,
-        }
+        };
+        source.sync_effect_params();
+        source
     }
 
     /// Push the stored tuning of the active effect into its freshly built
@@ -687,6 +724,44 @@ mod tests {
                 .value,
             128
         );
+    }
+
+    /// A board that persists the selection restores its parameters through the
+    /// config, and a record from a firmware with different bounds must not be
+    /// able to push a value the effect would reject from a host.
+    #[test]
+    fn restored_parameters_are_applied_and_individually_bounds_checked() {
+        let boot = |initial_param_len, params: [u8; MAX_INITIAL_PARAMS]| {
+            let source: PaletteFxSource<_, 1, 1> = PaletteFxSource::new(
+                SliceLayout::new(&POSITIONS),
+                &NO_HITS,
+                PaletteFxConfig {
+                    initial_effect: Effect::<1>::RAIN_INDEX,
+                    initial_params: params,
+                    initial_param_len,
+                    ..PaletteFxConfig::default()
+                },
+            );
+            source
+                .effect
+                .rain_params()
+                .expect("Rain carries rain params")
+        };
+
+        let mut wanted = RainParams::DEFAULT;
+        assert!(wanted.set(0, 3));
+        assert!(wanted.set(2, 200));
+        assert_eq!(boot(4, [3, 30, 200, 14, 0, 0, 0, 0]), wanted);
+
+        // Zero is below every parameter's minimum: a truncated or empty record
+        // must leave the defaults alone rather than zeroing the effect.
+        assert_eq!(boot(0, [0; MAX_INITIAL_PARAMS]), RainParams::DEFAULT);
+        assert_eq!(boot(4, [0; MAX_INITIAL_PARAMS]), RainParams::DEFAULT);
+
+        // Only the out-of-range entry is dropped; the valid one still lands.
+        let mut partial = RainParams::DEFAULT;
+        assert!(partial.set(0, 2));
+        assert_eq!(boot(2, [2, 0, 0, 0, 0, 0, 0, 0]), partial);
     }
 
     /// Nothing persists the live selection, so `initial_effect` is what the
