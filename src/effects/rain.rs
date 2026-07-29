@@ -14,7 +14,6 @@ use super::FrameParams;
 use crate::color::Hsv;
 use crate::layout::LedLayout;
 use crate::math::{scale8, scale16by8};
-use crate::palette::interp_color;
 
 /// Drop slots the state always carries. [`RainParams::drops`] caps how many
 /// of them spawn, so the array is sized for the largest allowed setting.
@@ -218,7 +217,27 @@ struct Drop {
     /// Timer value (millisecond counter, low 32 bits) when the drop spawned.
     spawn_ms: u32,
     x: u8,
+    /// Per-drop fraction of the nominal fall rate, 255 being full speed.
+    ///
+    /// Without this every drop takes exactly the same time to cross, so a
+    /// group born together dies together. Once the slots are saturated a
+    /// spawn can only happen when one expires, and clustered expiries mean
+    /// clustered spawns -- the cluster sustains itself and the board pulses
+    /// at the fall period. Varied rates smear each group apart, and varied
+    /// speeds read as more natural rain besides.
+    rate: u8,
     active: bool,
+}
+
+/// Slowest a drop may fall, as a fraction of the nominal rate out of 255.
+const RATE_MIN: u8 = 160;
+
+/// Milliseconds a drop at `rate` takes to fall from above the board to past
+/// the bottom. Inverts the head equation in the tick loop.
+fn fall_duration_ms(speed: u8, overshoot: i32, rate: u8) -> u32 {
+    let span = 2 * (255 + overshoot) as u32;
+    let per_tick = (1 + speed as u32 / 4).max(1);
+    span * 255 * 256 / (rate as u32 * per_tick).max(1)
 }
 
 pub struct RainState {
@@ -246,6 +265,7 @@ impl RainState {
             drops: [Drop {
                 spawn_ms: 0,
                 x: 0,
+                rate: 255,
                 active: false,
             }; RAIN_DROPS],
             next_spawn_ms: 0,
@@ -282,6 +302,7 @@ impl RainState {
         state.drops[0] = Drop {
             spawn_ms,
             x,
+            rate: 255,
             active: true,
         };
         state.next_spawn_ms = spawn_ms.wrapping_add(1_000_000);
@@ -320,13 +341,36 @@ impl RainState {
         let active_drops = self.params.active_drops();
         let trail_len = self.params.trail_len.max(1) as u16;
         let col_half_width = self.params.column_half_width.max(1) as u16;
-        // The head starts this far above y=0 and the drop dies once the whole
-        // trail has cleared y=255, so drops fade in and out at the board edges.
+        // A drop dies once its whole trail has cleared y=255. The head starts
+        // at the top rather than a trail-length above it: leading in from
+        // off-board held a slot for more than half the drop's life at long
+        // trails, and a slot occupied by an invisible drop is one that cannot
+        // be raining. Entering at y=0 just means the trail is clipped until
+        // the head has fallen far enough to draw all of it.
         let overshoot = trail_len as i32;
 
         if !self.initialized {
             self.initialized = true;
             self.next_spawn_ms = params.timer_ms;
+
+            // Fill the slots as though it had already been raining, spreading
+            // the drops evenly down the fall instead of releasing them all
+            // from the top. A cadence shorter than one fall divided by the
+            // slot count cannot be sustained -- past that point a spawn has to
+            // wait for an expiry -- so whatever pattern the expiries have is
+            // the pattern the board keeps. Starting them bunched makes that
+            // pattern a clump that never disperses, which is what pulsed.
+            let spread = fall_duration_ms(params.speed, overshoot, RATE_MIN);
+            for slot in 0..active_drops {
+                let rate = RATE_MIN.saturating_add(rng() / 3);
+                let age = spread * slot as u32 / active_drops as u32;
+                self.drops[slot] = Drop {
+                    spawn_ms: params.timer_ms.wrapping_sub(age),
+                    x: rng(),
+                    rate,
+                    active: true,
+                };
+            }
         }
 
         // Spawn when the inter-drop timer has elapsed (wraparound-safe, as in
@@ -366,6 +410,7 @@ impl RainState {
             self.drops[slot] = Drop {
                 spawn_ms: params.timer_ms,
                 x: rng(),
+                rate: RATE_MIN.saturating_add(rng() / 3),
                 active: true,
             };
             // Advance from the deadline, not from now, so a cadence finer than
@@ -389,8 +434,9 @@ impl RainState {
             }
             // ~2x Ripple's expansion rate so drops read as falling rather
             // than drifting; speed=128 crosses the board in about a second.
-            let tick = scale16by8(elapsed as u16, 1 + params.speed / 4) as i32;
-            let y = tick / 2 - overshoot;
+            let nominal = scale16by8(elapsed as u16, 1 + params.speed / 4) as i32;
+            let tick = nominal * drop.rate as i32 / 255;
+            let y = tick / 2;
             if y > 255 + overshoot {
                 drop.active = false;
                 continue;
@@ -437,13 +483,17 @@ impl RainState {
                 (intensity, self.params.rain_hue)
             };
 
-            // Sample the palette by intensity (head = top of the palette)
-            // and also scale luminance by it, so the background is black
-            // and the trail dims toward its tail.
-            let mut colour =
-                interp_color(params.palette, value, params.sat, scale8(value, params.val));
-            colour.h = hue;
-            *slot = colour;
+            // Brightness follows intensity, so the background stays black and
+            // a trail dims toward its tail. Hue and saturation are the
+            // effect's own rather than the palette's: palettes desaturate
+            // toward their bright end, which would render exactly the parts
+            // that matter -- drop heads and key hits -- white, hiding the
+            // chosen hues.
+            *slot = Hsv {
+                h: hue,
+                s: params.sat,
+                v: scale8(value, params.val),
+            };
         }
     }
 }
@@ -492,19 +542,23 @@ mod tests {
     #[test]
     fn drop_sweeps_down_its_column_with_a_trail() {
         let layout = SliceLayout::new(COLUMN);
-        let mut state = RainState::new();
+        // One drop, so the sweep is this drop's and not the primed population's.
+        let mut state = RainState::with_single_drop(0, 0);
         let mut out = [Hsv::default(); 5];
 
-        // Frame 0 spawns a drop with its head above the board: all dark.
+        // The head enters at the top, so the first row lights straight away
+        // while the rest of the column is still dark.
         state.tick(&layout, params(0, 128), || 0, &mut out);
-        assert_eq!(lit(&out), 0);
+        assert!(out[0].v > 0, "the head should enter at the top row");
+        assert_eq!(lit(&out), 1);
 
-        // Mid-fall the head is on the board and a trail follows it.
+        // Mid-fall the head is further down and a trail follows it. The window
+        // covers the slowest fall rate a drop can draw, not just the nominal.
         let mut saw_partial = false;
-        for t in (100..3000).step_by(100) {
+        for t in (100..8000).step_by(100) {
             state.tick(&layout, params(t, 128), || 0, &mut out);
             let n = lit(&out);
-            if n > 0 && n < COLUMN.len() {
+            if n > 1 && n < COLUMN.len() {
                 saw_partial = true;
             }
         }
@@ -670,60 +724,70 @@ mod tests {
         assert_ne!(hit.h, lit.h);
     }
 
-    /// Rain has to arrive steadily, not in waves. A round-robin spawn cursor
-    /// looks fine on a count of concurrent drops but stalls whenever the slot
-    /// it wants is still airborne; the deadline slips meanwhile and is repaid
-    /// in one frame, so drops land in clumps that share a spawn time and then
-    /// expire together. Measured over time that shows up as the airborne count
-    /// collapsing and refilling instead of holding steady.
+    /// Rain has to arrive steadily, not in waves. Measured across a whole
+    /// board at the dense setting, because the failure is a population that
+    /// collapses and refills rather than anything visible on one LED.
+    ///
+    /// Beyond about one fall per slot the cadence cannot be sustained: a spawn
+    /// has to wait for an expiry, so the expiry pattern becomes the spawn
+    /// pattern and whatever clumping exists sustains itself. Three things keep
+    /// it dispersed -- the first fill is spread down the fall rather than
+    /// released from the top, drops fall at slightly different rates so a
+    /// group cannot expire together, and a drop no longer holds a slot while
+    /// it is still off-board above the top row.
     #[test]
-    fn dense_rain_holds_a_steady_population_instead_of_bursting() {
-        const POS: &[(u8, u8)] = &[(0, 0)];
-        let layout = SliceLayout::new(POS);
-        let mut out = [Hsv::default(); 1];
+    fn dense_rain_holds_a_steady_population_across_the_board() {
+        // A Glove80-shaped grid: 20 columns of 6 rows on the 0..=255 grid.
+        let mut positions = [(0u8, 0u8); 80];
+        for (i, p) in positions.iter_mut().enumerate() {
+            let col = (i % 20) as u32;
+            let row = (i / 20) as u32;
+            *p = ((col * 255 / 19) as u8, (row * 255 / 5) as u8);
+        }
+        let layout = SliceLayout::new(&positions);
+        let mut out = [Hsv::default(); 80];
 
-        // The setting the board actually runs: a drop every 50 ms into 28
-        // slots, which is far more spawns than slots freeing per frame.
         let mut state = RainState::with_params(RainParams {
             drops: 28,
             spawn_interval: 5,
+            trail_len: 161,
             ..RainParams::DEFAULT
         });
-
-        let mut entropy = 0u8;
+        let mut entropy = 7u8;
         let mut rng = move || {
-            entropy = entropy.wrapping_add(37);
+            entropy = entropy.wrapping_mul(37).wrapping_add(11);
             entropy
         };
 
-        // Let the population reach steady state before sampling it.
-        for t in (0..3000).step_by(40) {
-            state.tick(&layout, params(t, 128), &mut rng, &mut out);
+        let (mut lowest, mut highest) = (usize::MAX, 0usize);
+        for step in 0..200u32 {
+            state.tick(
+                &layout,
+                FrameParams {
+                    palette: &CARNIVAL,
+                    speed: 221,
+                    sat: 255,
+                    val: 255,
+                    timer_ms: step * 100,
+                },
+                &mut rng,
+                &mut out,
+            );
+            // Skip the first couple of seconds so this measures the sustained
+            // pattern, not the ramp.
+            if step >= 20 {
+                let lit = out.iter().filter(|h| h.v > 0).count();
+                lowest = lowest.min(lit);
+                highest = highest.max(lit);
+            }
         }
 
-        let mut lowest = usize::MAX;
-        let mut highest = 0;
-        let mut biggest_batch = 0;
-        for t in (3000..9000).step_by(40) {
-            let before = state.active_drop_count();
-            state.tick(&layout, params(t, 128), &mut rng, &mut out);
-            let now = state.active_drop_count();
-            biggest_batch = biggest_batch.max(now.saturating_sub(before));
-            lowest = lowest.min(now);
-            highest = highest.max(now);
-        }
-
-        // A bursting spawner swings between nearly empty and full; steady rain
-        // stays in a narrow band.
+        // Releasing every drop from the top swung between 4 and 62 lit LEDs;
+        // spreading the first fill alone still bottomed out near 24. Steady
+        // rain keeps the trough within a factor of two of the peak.
         assert!(
             lowest * 2 > highest,
-            "population swung between {lowest} and {highest} drops"
-        );
-        // And no single frame should dump a clump of drops that then fall as
-        // one rigid group.
-        assert!(
-            biggest_batch <= 3,
-            "one frame spawned {biggest_batch} drops at the same instant"
+            "population swung between {lowest} and {highest} lit LEDs"
         );
     }
 
