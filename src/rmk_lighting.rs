@@ -27,7 +27,7 @@ use rmk::types::action::LightAction;
 use rmk::lighting::topology::LightingTopology;
 
 use crate::color::{Hsv, hsv_to_rgb};
-use crate::effects::{Effect, FrameParams, RainParams};
+use crate::effects::{Effect, FlowState, FrameParams, RainParams};
 use crate::layout::LedLayout;
 use crate::palette::{BUILTIN_PALETTE_NAMES, BUILTIN_PALETTES};
 
@@ -97,6 +97,10 @@ pub struct PaletteFxConfig {
     pub speed_step: u8,
     /// Index into [`BUILTIN_PALETTES`] to start on.
     pub initial_palette: usize,
+    /// Index into [`Effect::NAMES`] to boot into. Nothing persists the live
+    /// selection across a power cycle, so this is what the board comes up
+    /// with every time. Out-of-range values fall back to Flow.
+    pub initial_effect: u8,
     /// Frame cadence in milliseconds (40 ≈ 25 fps).
     pub frame_interval_ms: u64,
 }
@@ -111,6 +115,8 @@ impl Default for PaletteFxConfig {
             initial_speed: 128,
             speed_step: 16,
             initial_palette: 0,
+            // An animated default shows the system is alive.
+            initial_effect: Effect::<1>::FLOW_INDEX,
             frame_interval_ms: 40,
         }
     }
@@ -207,9 +213,8 @@ pub struct PaletteFxSource<L: LedLayout, const N: usize, const HITS: usize = 16>
 
 impl<L: LedLayout, const N: usize, const HITS: usize> PaletteFxSource<L, N, HITS> {
     pub fn new(layout: L, hits: &'static HitQueue<HITS>, config: PaletteFxConfig) -> Self {
-        let mut effect = Effect::Gradient;
-        // Boot into Flow: an animated default shows the system is alive.
-        effect.next(0);
+        let effect = Effect::from_index(config.initial_effect, 0)
+            .unwrap_or_else(|| Effect::Flow(FlowState::new()));
         let last_nonzero_val = if config.initial_val == 0 {
             config.min_val.max(1)
         } else {
@@ -681,6 +686,31 @@ mod tests {
                 .unwrap()
                 .value,
             128
+        );
+    }
+
+    /// Nothing persists the live selection, so `initial_effect` is what the
+    /// board shows on every boot. An out-of-range index must still leave an
+    /// animated effect running rather than refusing to construct.
+    #[test]
+    fn the_configured_initial_effect_is_what_boots() {
+        let boot = |initial_effect| {
+            let source: PaletteFxSource<_, 1, 1> = PaletteFxSource::new(
+                SliceLayout::new(&POSITIONS),
+                &NO_HITS,
+                PaletteFxConfig {
+                    initial_effect,
+                    ..PaletteFxConfig::default()
+                },
+            );
+            source.effect.index()
+        };
+
+        assert_eq!(boot(Effect::<1>::STORM_INDEX), Effect::<1>::STORM_INDEX);
+        assert_eq!(boot(Effect::<1>::RAIN_INDEX), Effect::<1>::RAIN_INDEX);
+        assert_eq!(
+            boot(Effect::<1>::NAMES.len() as u8),
+            Effect::<1>::FLOW_INDEX
         );
     }
 }

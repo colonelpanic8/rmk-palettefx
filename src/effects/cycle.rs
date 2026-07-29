@@ -43,6 +43,8 @@ impl<const HITS: usize> Effect<HITS> {
         "Gradient", "Flow", "Vortex", "Sparkle", "Ripple", "Rain", "Reactive", "Storm",
     ];
 
+    /// Stable index of the Flow effect into [`Self::NAMES`].
+    pub const FLOW_INDEX: u8 = 1;
     /// Stable index of the Rain effect into [`Self::NAMES`].
     pub const RAIN_INDEX: u8 = 5;
     /// Stable index of the Storm effect into [`Self::NAMES`].
