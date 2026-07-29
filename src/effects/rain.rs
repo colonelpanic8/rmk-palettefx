@@ -53,6 +53,16 @@ pub struct RainParams {
     /// On a Glove80 (~10 columns per half mapped across 0..=255) the default
     /// covers roughly one key column with soft edges on the neighbours.
     pub column_half_width: u8,
+    /// Hue of the rain itself. Rain reads its brightness and saturation ramp
+    /// from the palette but takes its hue from here, so the streaks stay one
+    /// colour instead of sliding along the palette's gradient as a drop fades.
+    /// 86 is green, 172 blue.
+    pub rain_hue: u8,
+    /// Hue of a blended-in contribution that outshines the rain — Storm's key
+    /// hits. Separate from [`Self::rain_hue`] so a hit reads as a hit rather
+    /// than as unusually bright rain. Plain Rain blends nothing, so this only
+    /// advertises on effects that do.
+    pub hit_hue: u8,
 }
 
 impl RainParams {
@@ -67,6 +77,17 @@ impl RainParams {
     pub const TRAIL_LEN_MAX: u8 = 255;
     pub const COLUMN_HALF_WIDTH_MIN: u8 = 4;
     pub const COLUMN_HALF_WIDTH_MAX: u8 = 64;
+    pub const HUE_MIN: u8 = 0;
+    pub const HUE_MAX: u8 = 255;
+
+    /// Pure hues under the spectrum conversion in [`crate::color`], which
+    /// divides the wheel into six 43-wide sectors.
+    pub const HUE_GREEN: u8 = 86;
+    pub const HUE_BLUE: u8 = 172;
+
+    /// Parameters every rain-backed effect advertises. Anything past this is
+    /// specific to an effect that blends another source over the rain.
+    pub const RAIN_ONLY_COUNT: u8 = 5;
 
     /// The tuned defaults. Also the values advertised as each parameter's
     /// `default` to hosts.
@@ -75,16 +96,26 @@ impl RainParams {
         spawn_interval: 30,
         trail_len: 128,
         column_half_width: 14,
+        // Blue rain with green key hits: two hues far enough apart that a hit
+        // is unmistakable against the downpour.
+        rain_hue: Self::HUE_BLUE,
+        hit_hue: Self::HUE_GREEN,
     };
 
     /// Number of parameters, i.e. the valid range of the indices accepted by
     /// [`Self::get`] and [`Self::set`].
-    pub const COUNT: u8 = 4;
+    pub const COUNT: u8 = 6;
 
     /// Host-facing parameter names, in index order. `Spawn` carries its
     /// encoding in the name because the value is not milliseconds.
-    pub const NAMES: [&'static str; Self::COUNT as usize] =
-        ["Drops", "Spawn x10ms", "Trail", "Width"];
+    pub const NAMES: [&'static str; Self::COUNT as usize] = [
+        "Drops",
+        "Spawn x10ms",
+        "Trail",
+        "Width",
+        "Rain hue",
+        "Hit hue",
+    ];
 
     /// Inclusive lower bound of each parameter, in index order.
     pub const MINS: [u8; Self::COUNT as usize] = [
@@ -92,6 +123,8 @@ impl RainParams {
         Self::SPAWN_INTERVAL_MIN,
         Self::TRAIL_LEN_MIN,
         Self::COLUMN_HALF_WIDTH_MIN,
+        Self::HUE_MIN,
+        Self::HUE_MIN,
     ];
 
     /// Inclusive upper bound of each parameter, in index order.
@@ -100,6 +133,8 @@ impl RainParams {
         Self::SPAWN_INTERVAL_MAX,
         Self::TRAIL_LEN_MAX,
         Self::COLUMN_HALF_WIDTH_MAX,
+        Self::HUE_MAX,
+        Self::HUE_MAX,
     ];
 
     /// Default of each parameter, in index order.
@@ -108,6 +143,8 @@ impl RainParams {
         Self::DEFAULT.spawn_interval,
         Self::DEFAULT.trail_len,
         Self::DEFAULT.column_half_width,
+        Self::DEFAULT.rain_hue,
+        Self::DEFAULT.hit_hue,
     ];
 
     /// Value of one parameter, or `None` when `index` is out of range.
@@ -117,6 +154,8 @@ impl RainParams {
             1 => self.spawn_interval,
             2 => self.trail_len,
             3 => self.column_half_width,
+            4 => self.rain_hue,
+            5 => self.hit_hue,
             _ => return None,
         })
     }
@@ -134,6 +173,8 @@ impl RainParams {
             1 => self.spawn_interval = value,
             2 => self.trail_len = value,
             3 => self.column_half_width = value,
+            4 => self.rain_hue = value,
+            5 => self.hit_hue = value,
             _ => return false,
         }
         true
@@ -182,7 +223,6 @@ struct Drop {
 
 pub struct RainState {
     drops: [Drop; RAIN_DROPS],
-    drops_tail: usize,
     next_spawn_ms: u32,
     initialized: bool,
     params: RainParams,
@@ -208,7 +248,6 @@ impl RainState {
                 x: 0,
                 active: false,
             }; RAIN_DROPS],
-            drops_tail: 0,
             next_spawn_ms: 0,
             initialized: false,
             params,
@@ -220,10 +259,6 @@ impl RainState {
     /// stops the surplus slots from respawning once they expire.
     pub const fn set_params(&mut self, params: RainParams) {
         self.params = params;
-        let active = params.active_drops();
-        if self.drops_tail >= active {
-            self.drops_tail = 0;
-        }
     }
 
     /// The tuning currently in effect.
@@ -249,7 +284,6 @@ impl RainState {
             x,
             active: true,
         };
-        state.drops_tail = 0;
         state.next_spawn_ms = spawn_ms.wrapping_add(1_000_000);
         state
     }
@@ -295,33 +329,47 @@ impl RainState {
             self.next_spawn_ms = params.timer_ms;
         }
 
-        // Spawn a new drop if the slot at `drops_tail` is free and the
-        // inter-drop timer has elapsed (wraparound-safe, as in Ripple).
+        // Spawn when the inter-drop timer has elapsed (wraparound-safe, as in
+        // Ripple). A cadence shorter than the frame interval owes more than
+        // one drop per tick, so keep spawning while the deadline is behind
+        // rather than once per frame -- otherwise the frame rate, not the
+        // cadence, would set the ceiling on density.
         let due = |deadline: u32| params.timer_ms.wrapping_sub(deadline) < u32::MAX / 2;
 
-        // A cadence shorter than the frame interval owes more than one drop
-        // per tick, so spawn until the backlog is cleared instead of once per
-        // frame -- otherwise the frame rate, not the parameter, sets the
-        // ceiling on density. Each pass fills one slot, so `active_drops`
-        // bounds the loop.
+        // A deadline left far behind (the effect was just selected, or the
+        // board slept) restarts from now rather than firing every slot at once.
         if due(self.next_spawn_ms)
             && params.timer_ms.wrapping_sub(self.next_spawn_ms) > CADENCE_RESYNC_MS
         {
             self.next_spawn_ms = params.timer_ms;
         }
+
+        // Each pass fills one slot, so the slot count bounds the loop.
         for _ in 0..active_drops {
-            if self.drops[self.drops_tail].active || !due(self.next_spawn_ms) {
+            if !due(self.next_spawn_ms) {
                 break;
             }
-            let slot = self.drops_tail;
+            // Take any free slot, not the next one in sequence. Waiting on one
+            // particular slot lets a drop still in flight stall spawning while
+            // the deadline keeps slipping, and the debt is then repaid all at
+            // once the moment that slot expires -- drops arrive in clumps that
+            // share a spawn time, fall as a rigid group, and expire together,
+            // which reads as a periodic burst rather than steady rain.
+            let Some(slot) = self.drops[..active_drops].iter().position(|d| !d.active) else {
+                // Genuinely saturated: hold the cadence at the current time
+                // instead of banking a backlog to dump later.
+                self.next_spawn_ms = params
+                    .timer_ms
+                    .wrapping_add(self.params.spawn_delay_ms(rng()).max(1));
+                break;
+            };
             self.drops[slot] = Drop {
                 spawn_ms: params.timer_ms,
                 x: rng(),
                 active: true,
             };
-            self.drops_tail = (slot + 1) % active_drops;
-            // Advance from the deadline, not from now, so a cadence finer
-            // than the frame interval keeps its average rate.
+            // Advance from the deadline, not from now, so a cadence finer than
+            // the frame interval keeps its average rate.
             self.next_spawn_ms = self
                 .next_spawn_ms
                 .wrapping_add(self.params.spawn_delay_ms(rng()).max(1));
@@ -378,17 +426,24 @@ impl RainState {
                 intensity = intensity.max(scale8(along, across));
             }
 
-            intensity = intensity.max(extra(i, lx, ly));
+            // Whichever contribution is brighter owns the pixel. Colouring
+            // after that choice, rather than sampling one palette position for
+            // the combined intensity, is what lets a key hit read as its own
+            // colour instead of as unusually bright rain.
+            let hit = extra(i, lx, ly);
+            let (value, hue) = if hit > intensity {
+                (hit, self.params.hit_hue)
+            } else {
+                (intensity, self.params.rain_hue)
+            };
 
             // Sample the palette by intensity (head = top of the palette)
             // and also scale luminance by it, so the background is black
             // and the trail dims toward its tail.
-            *slot = interp_color(
-                params.palette,
-                intensity,
-                params.sat,
-                scale8(intensity, params.val),
-            );
+            let mut colour =
+                interp_color(params.palette, value, params.sat, scale8(value, params.val));
+            colour.h = hue;
+            *slot = colour;
         }
     }
 }
@@ -495,7 +550,9 @@ mod tests {
                 params.drops,
                 params.spawn_interval,
                 params.trail_len,
-                params.column_half_width
+                params.column_half_width,
+                params.rain_hue,
+                params.hit_hue
             ]
         );
     }
@@ -585,6 +642,89 @@ mod tests {
             state.tick(&layout, params(t, 128), || 0, &mut out);
             assert!(state.active_drop_count() <= RainParams::DROPS_MAX as usize);
         }
+    }
+
+    /// A key hit has to be legible as a hit, not as unusually bright rain, so
+    /// the brighter contribution picks the colour and a hit rotates its hue.
+    #[test]
+    fn a_blended_hit_takes_its_own_hue() {
+        const POS: &[(u8, u8)] = &[(0, 0)];
+        let layout = SliceLayout::new(POS);
+        let mut out = [Hsv::default(); 1];
+
+        let mut state = RainState::with_params(RainParams::DEFAULT);
+        // No drop reaches this LED, so the hit is the only contribution.
+        state.tick_blend(&layout, params(0, 128), || 200, &mut out, |_, _, _| 255);
+        let hit = out[0];
+        assert_eq!(hit.h, RainParams::HUE_GREEN);
+
+        // The same LED with no hit takes the rain's hue instead. Walk time
+        // until the falling head actually reaches it.
+        let mut rain = RainState::with_single_drop(0, 0);
+        let lit = (0..6000).step_by(100).find_map(|t| {
+            rain.tick(&layout, params(t, 128), || 0, &mut out);
+            (out[0].v > 0).then_some(out[0])
+        });
+        let lit = lit.expect("the drop should light this LED as it falls past");
+        assert_eq!(lit.h, RainParams::HUE_BLUE);
+        assert_ne!(hit.h, lit.h);
+    }
+
+    /// Rain has to arrive steadily, not in waves. A round-robin spawn cursor
+    /// looks fine on a count of concurrent drops but stalls whenever the slot
+    /// it wants is still airborne; the deadline slips meanwhile and is repaid
+    /// in one frame, so drops land in clumps that share a spawn time and then
+    /// expire together. Measured over time that shows up as the airborne count
+    /// collapsing and refilling instead of holding steady.
+    #[test]
+    fn dense_rain_holds_a_steady_population_instead_of_bursting() {
+        const POS: &[(u8, u8)] = &[(0, 0)];
+        let layout = SliceLayout::new(POS);
+        let mut out = [Hsv::default(); 1];
+
+        // The setting the board actually runs: a drop every 50 ms into 28
+        // slots, which is far more spawns than slots freeing per frame.
+        let mut state = RainState::with_params(RainParams {
+            drops: 28,
+            spawn_interval: 5,
+            ..RainParams::DEFAULT
+        });
+
+        let mut entropy = 0u8;
+        let mut rng = move || {
+            entropy = entropy.wrapping_add(37);
+            entropy
+        };
+
+        // Let the population reach steady state before sampling it.
+        for t in (0..3000).step_by(40) {
+            state.tick(&layout, params(t, 128), &mut rng, &mut out);
+        }
+
+        let mut lowest = usize::MAX;
+        let mut highest = 0;
+        let mut biggest_batch = 0;
+        for t in (3000..9000).step_by(40) {
+            let before = state.active_drop_count();
+            state.tick(&layout, params(t, 128), &mut rng, &mut out);
+            let now = state.active_drop_count();
+            biggest_batch = biggest_batch.max(now.saturating_sub(before));
+            lowest = lowest.min(now);
+            highest = highest.max(now);
+        }
+
+        // A bursting spawner swings between nearly empty and full; steady rain
+        // stays in a narrow band.
+        assert!(
+            lowest * 2 > highest,
+            "population swung between {lowest} and {highest} drops"
+        );
+        // And no single frame should dump a clump of drops that then fall as
+        // one rigid group.
+        assert!(
+            biggest_batch <= 3,
+            "one frame spawned {biggest_batch} drops at the same instant"
+        );
     }
 
     /// Jitter scales with the cadence instead of being a fixed spread, so a

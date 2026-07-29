@@ -171,16 +171,20 @@ const fn rain_param_specs() -> [ExtensionParamSpec; RainParams::COUNT as usize] 
 }
 
 /// Per-effect parameter rows, indexed exactly like `Effect::NAMES`. Rain and
-/// Storm share one row: Storm's background is the rain, so it takes the same
-/// knobs. Every other effect advertises none.
+/// Storm share the rain knobs, but only Storm advertises the hit hue: it is
+/// the one that blends another source over the rain, so on Rain the knob
+/// would do nothing. Trailing entries are hidden by slicing rather than by a
+/// second table, so the two rows cannot drift apart.
 static EFFECT_PARAMS: [&[ExtensionParamSpec]; EFFECT_COUNT] = [
-    &[],               // Gradient
-    &[],               // Flow
-    &[],               // Vortex
-    &[],               // Sparkle
-    &[],               // Ripple
-    &RAIN_PARAM_SPECS, // Rain
-    &[],               // Reactive
+    &[], // Gradient
+    &[], // Flow
+    &[], // Vortex
+    &[], // Sparkle
+    &[], // Ripple
+    RAIN_PARAM_SPECS
+        .split_at(RainParams::RAIN_ONLY_COUNT as usize)
+        .0, // Rain
+    &[], // Reactive
     &RAIN_PARAM_SPECS, // Storm
 ];
 
@@ -544,9 +548,22 @@ mod tests {
         let descriptor =
             <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::extension_descriptor(&source)
                 .unwrap();
+        // Storm advertises one more knob than Rain: the hue its key hits take.
+        // Rain blends nothing over itself, so advertising it there would offer
+        // a control that cannot do anything.
+        assert_eq!(
+            descriptor
+                .effect_params(Effect::<1>::RAIN_INDEX)
+                .unwrap()
+                .len(),
+            RainParams::RAIN_ONLY_COUNT as usize,
+        );
+        let storm = descriptor.effect_params(Effect::<1>::STORM_INDEX).unwrap();
+        assert_eq!(storm.len(), RainParams::COUNT as usize);
+        assert_eq!(storm[storm.len() - 1].name, "Hit hue");
+
         for effect in [Effect::<1>::RAIN_INDEX, Effect::<1>::STORM_INDEX] {
             let specs = descriptor.effect_params(effect).unwrap();
-            assert_eq!(specs.len(), RainParams::COUNT as usize);
             for (index, spec) in specs.iter().enumerate() {
                 assert_eq!(spec.name, RainParams::NAMES[index]);
                 assert_eq!(spec.min, RainParams::MINS[index]);
