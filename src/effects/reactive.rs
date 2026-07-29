@@ -57,8 +57,9 @@ impl<const N: usize> ReactiveState<N> {
         self.next = (self.next + 1) % N;
     }
 
-    pub fn tick<L: LedLayout>(&mut self, layout: &L, params: FrameParams<'_>, out: &mut [Hsv]) {
-        // Precompute each active hit's current amplitude.
+    /// Advance the hits one frame (expiring finished ones) and return each
+    /// slot's current bump amplitude, for [`Self::value_at`].
+    pub fn amplitudes(&mut self, params: FrameParams<'_>) -> [u8; N] {
         let mut hit_amplitude = [0u8; N];
         for (j, amp) in hit_amplitude.iter_mut().enumerate() {
             if !self.hits[j].active {
@@ -72,31 +73,44 @@ impl<const N: usize> ReactiveState<N> {
                 self.hits[j].active = false;
             }
         }
+        hit_amplitude
+    }
 
-        for (i, slot) in out.iter_mut().enumerate() {
-            let (lx, ly) = layout.position(i);
-            let mut value: u8 = 0;
+    /// Bump intensity at LED position `(lx, ly)` given the amplitudes from
+    /// [`Self::amplitudes`] for this frame.
+    pub fn value_at(&self, hit_amplitude: &[u8; N], lx: u8, ly: u8) -> u8 {
+        let mut value: u8 = 0;
 
-            for (j, &amp) in hit_amplitude.iter().enumerate() {
-                if amp == 0 {
-                    continue;
-                }
-                let dx = abs_half_diff(lx, self.hits[j].x);
-                let dy = abs_half_diff(ly, self.hits[j].y);
-                if dx < 21 && dy < 21 {
-                    let dist_sqr = (dx as u16) * (dx as u16) + (dy as u16) * (dy as u16);
-                    if dist_sqr < 21 * 21 {
-                        let dist = sqrt16(dist_sqr);
-                        value = qadd8(
-                            value,
-                            scale8(255u8.wrapping_sub(12u8.wrapping_mul(dist)), amp),
-                        );
-                        if value == 255 {
-                            break;
-                        }
+        for (j, &amp) in hit_amplitude.iter().enumerate() {
+            if amp == 0 {
+                continue;
+            }
+            let dx = abs_half_diff(lx, self.hits[j].x);
+            let dy = abs_half_diff(ly, self.hits[j].y);
+            if dx < 21 && dy < 21 {
+                let dist_sqr = (dx as u16) * (dx as u16) + (dy as u16) * (dy as u16);
+                if dist_sqr < 21 * 21 {
+                    let dist = sqrt16(dist_sqr);
+                    value = qadd8(
+                        value,
+                        scale8(255u8.wrapping_sub(12u8.wrapping_mul(dist)), amp),
+                    );
+                    if value == 255 {
+                        break;
                     }
                 }
             }
+        }
+
+        value
+    }
+
+    pub fn tick<L: LedLayout>(&mut self, layout: &L, params: FrameParams<'_>, out: &mut [Hsv]) {
+        let hit_amplitude = self.amplitudes(params);
+
+        for (i, slot) in out.iter_mut().enumerate() {
+            let (lx, ly) = layout.position(i);
+            let value = self.value_at(&hit_amplitude, lx, ly);
 
             let mut hsv = interp_color(params.palette, value, params.sat, params.val);
             if value < 32 {

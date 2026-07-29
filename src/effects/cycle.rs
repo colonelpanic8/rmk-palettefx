@@ -10,6 +10,7 @@ use super::{
 };
 use crate::color::Hsv;
 use crate::layout::LedLayout;
+use rand_core::Rng;
 
 /// Stream selector for the Ripple RNG; any odd constant works, this one is
 /// from the PCG reference implementation.
@@ -29,13 +30,16 @@ pub enum Effect<const HITS: usize> {
     Ripple(RippleState, Pcg32),
     Rain(RainState, Pcg32),
     Reactive(ReactiveState<HITS>),
+    /// Rain as the ambient background with Reactive's key-hit bumps
+    /// blended over it.
+    Storm(RainState, Pcg32, ReactiveState<HITS>),
 }
 
 impl<const HITS: usize> Effect<HITS> {
     /// Display names in stable index order; `index`/`from_index` and the
     /// next/prev cycle all agree with this ordering.
-    pub const NAMES: [&'static str; 7] = [
-        "Gradient", "Flow", "Vortex", "Sparkle", "Ripple", "Rain", "Reactive",
+    pub const NAMES: [&'static str; 8] = [
+        "Gradient", "Flow", "Vortex", "Sparkle", "Ripple", "Rain", "Reactive", "Storm",
     ];
 
     /// Stable index of the active effect into [`Self::NAMES`].
@@ -48,6 +52,7 @@ impl<const HITS: usize> Effect<HITS> {
             Self::Ripple(_, _) => 4,
             Self::Rain(_, _) => 5,
             Self::Reactive(_) => 6,
+            Self::Storm(_, _, _) => 7,
         }
     }
 
@@ -62,6 +67,11 @@ impl<const HITS: usize> Effect<HITS> {
             4 => Self::Ripple(RippleState::new(), ripple_rng(ripple_seed)),
             5 => Self::Rain(RainState::new(), rain_rng(ripple_seed)),
             6 => Self::Reactive(ReactiveState::new()),
+            7 => Self::Storm(
+                RainState::new(),
+                rain_rng(ripple_seed),
+                ReactiveState::new(),
+            ),
             _ => return None,
         })
     }
@@ -76,6 +86,17 @@ impl<const HITS: usize> Effect<HITS> {
             Self::Ripple(s, rng) => s.tick_with_rng(rng, layout, params, out),
             Self::Rain(s, rng) => s.tick_with_rng(rng, layout, params, out),
             Self::Reactive(s) => s.tick(layout, params, out),
+            Self::Storm(rain, rng, reactive) => {
+                let amps = reactive.amplitudes(params);
+                let reactive = &*reactive;
+                rain.tick_blend(
+                    layout,
+                    params,
+                    || rng.next_u32() as u8,
+                    out,
+                    |_, lx, ly| reactive.value_at(&amps, lx, ly),
+                );
+            }
         }
     }
 
@@ -90,14 +111,24 @@ impl<const HITS: usize> Effect<HITS> {
             Self::Sparkle(_) => Self::Ripple(RippleState::new(), ripple_rng(ripple_seed)),
             Self::Ripple(_, _) => Self::Rain(RainState::new(), rain_rng(ripple_seed)),
             Self::Rain(_, _) => Self::Reactive(ReactiveState::new()),
-            Self::Reactive(_) => Self::Gradient,
+            Self::Reactive(_) => Self::Storm(
+                RainState::new(),
+                rain_rng(ripple_seed),
+                ReactiveState::new(),
+            ),
+            Self::Storm(_, _, _) => Self::Gradient,
         };
     }
 
     /// Switch to the previous effect in the cycle; see [`Effect::next`].
     pub fn prev(&mut self, ripple_seed: u64) {
         *self = match self {
-            Self::Gradient => Self::Reactive(ReactiveState::new()),
+            Self::Gradient => Self::Storm(
+                RainState::new(),
+                rain_rng(ripple_seed),
+                ReactiveState::new(),
+            ),
+            Self::Storm(_, _, _) => Self::Reactive(ReactiveState::new()),
             Self::Reactive(_) => Self::Rain(RainState::new(), rain_rng(ripple_seed)),
             Self::Rain(_, _) => Self::Ripple(RippleState::new(), ripple_rng(ripple_seed)),
             Self::Ripple(_, _) => Self::Sparkle(SparkleState::new()),
@@ -111,8 +142,10 @@ impl<const HITS: usize> Effect<HITS> {
     /// for every other variant. Returns `true` iff a hit was recorded, so
     /// the caller can skip a re-render that would not be visible.
     pub fn record_hit<L: LedLayout>(&mut self, layout: &L, led_idx: usize, timer_ms: u32) -> bool {
-        let Self::Reactive(s) = self else {
-            return false;
+        let s = match self {
+            Self::Reactive(s) => s,
+            Self::Storm(_, _, s) => s,
+            _ => return false,
         };
         let (x, y) = layout.position(led_idx);
         s.record_hit(x, y, timer_ms);
@@ -126,4 +159,46 @@ fn ripple_rng(seed: u64) -> Pcg32 {
 
 fn rain_rng(seed: u64) -> Pcg32 {
     Pcg32::new(seed, RAIN_RNG_STREAM)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::SliceLayout;
+    use crate::palette::CARNIVAL;
+
+    fn params(timer_ms: u32) -> FrameParams<'static> {
+        FrameParams {
+            palette: &CARNIVAL,
+            speed: 128,
+            sat: 255,
+            val: 255,
+            timer_ms,
+        }
+    }
+
+    /// In Storm, a key hit lights its LED even when no rain drop is in
+    /// that column, and without hits the same LED stays dark (rain keeps
+    /// its black background rather than Reactive's dim ambient one).
+    #[test]
+    fn storm_blends_key_hits_over_dark_rain_background() {
+        // x=200: the Storm RNG under this seed never places a drop close
+        // enough to this column during the frames we sample.
+        const LEDS: &[(u8, u8)] = &[(200, 128)];
+        let layout = SliceLayout::new(LEDS);
+        let mut out = [Hsv::default(); 1];
+
+        let mut quiet: Effect<8> = Effect::from_index(7, 1).expect("Storm index");
+        let mut hit: Effect<8> = Effect::from_index(7, 1).expect("Storm index");
+        assert!(hit.record_hit(&layout, 0, 0));
+
+        let mut hit_lit = false;
+        for t in (0..2000).step_by(50) {
+            quiet.tick(&layout, params(t), &mut out);
+            assert_eq!(out[0].v, 0, "no drop and no hit at t={t} must be black");
+            hit.tick(&layout, params(t), &mut out);
+            hit_lit |= out[0].v != 0;
+        }
+        assert!(hit_lit, "key hit never lit its LED");
+    }
 }

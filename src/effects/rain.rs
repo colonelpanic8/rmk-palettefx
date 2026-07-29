@@ -84,10 +84,30 @@ impl RainState {
     /// Tick the rain effect. `rng()` is called when a new drop is spawned
     /// and should return bytes uniformly over 0..=255; one byte picks the
     /// drop's x position, another the spawn jitter.
-    pub fn tick<L, R>(&mut self, layout: &L, params: FrameParams<'_>, mut rng: R, out: &mut [Hsv])
+    pub fn tick<L, R>(&mut self, layout: &L, params: FrameParams<'_>, rng: R, out: &mut [Hsv])
     where
         L: LedLayout,
         R: FnMut() -> u8,
+    {
+        self.tick_blend(layout, params, rng, out, |_, _, _| 0);
+    }
+
+    /// Like [`Self::tick`], but blends in an extra per-LED intensity from
+    /// `extra(led_index, lx, ly)`: the final palette lookup uses the max of
+    /// the rain intensity and the extra intensity. Lets another effect (e.g.
+    /// Reactive's key-hit bumps) render over the rain background while
+    /// keeping unlit LEDs black.
+    pub fn tick_blend<L, R, F>(
+        &mut self,
+        layout: &L,
+        params: FrameParams<'_>,
+        mut rng: R,
+        out: &mut [Hsv],
+        mut extra: F,
+    ) where
+        L: LedLayout,
+        R: FnMut() -> u8,
+        F: FnMut(usize, u8, u8) -> u8,
     {
         let count = layout.count();
 
@@ -163,6 +183,8 @@ impl RainState {
                 let across = 255 - (dx * 255 / COL_HALF_WIDTH) as u8;
                 intensity = intensity.max(scale8(along, across));
             }
+
+            intensity = intensity.max(extra(i, lx, ly));
 
             // Sample the palette by intensity (head = top of the palette)
             // and also scale luminance by it, so the background is black
