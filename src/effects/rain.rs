@@ -15,13 +15,13 @@ use crate::math::{scale8, scale16by8};
 use crate::palette::interp_color;
 
 /// Active drops. Kept small so the board reads as sparse: with the spawn
-/// cadence below, typically 2-4 drops are visible at once.
-const RAIN_DROPS: usize = 4;
-/// Base delay between spawns; a per-spawn random jitter of 0..=1020 ms is
+/// cadence below, typically 3-5 drops are visible at once.
+const RAIN_DROPS: usize = 6;
+/// Base delay between spawns; a per-spawn random jitter of 0..=510 ms is
 /// added on top so drops don't fall in lockstep.
-const RAIN_SPAWN_INTERVAL_MS: u32 = 500;
+const RAIN_SPAWN_INTERVAL_MS: u32 = 300;
 /// Trail length behind the head, in 0..=255 y-grid units.
-const TRAIL_LEN: u16 = 96;
+const TRAIL_LEN: u16 = 128;
 /// Half-width of the column a drop illuminates, in 0..=255 x-grid units.
 /// On a Glove80 (~10 columns per half mapped across 0..=255) this covers
 /// roughly one key column with soft edges on the neighbours.
@@ -110,7 +110,7 @@ impl RainState {
             self.drops_tail = (slot + 1) % RAIN_DROPS;
             self.next_spawn_ms = params
                 .timer_ms
-                .wrapping_add(RAIN_SPAWN_INTERVAL_MS + (rng() as u32) * 4);
+                .wrapping_add(RAIN_SPAWN_INTERVAL_MS + (rng() as u32) * 2);
         }
 
         // Head y-position per drop, in an extended coordinate so the head
