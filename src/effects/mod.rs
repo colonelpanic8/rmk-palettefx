@@ -1,4 +1,4 @@
-//! The six PaletteFx effects. Each effect writes one [`Hsv`](crate::color::Hsv)
+//! The PaletteFx effects. Each effect writes one [`Hsv`](crate::color::Hsv)
 //! per LED into the caller-supplied output slice; converting to RGB and
 //! pushing to the LED driver is the caller's responsibility.
 
@@ -7,6 +7,7 @@ use crate::palette::Palette;
 mod cycle;
 mod flow;
 mod gradient;
+mod rain;
 mod reactive;
 mod ripple;
 mod sparkle;
@@ -15,6 +16,7 @@ mod vortex;
 pub use cycle::Effect;
 pub use flow::FlowState;
 pub use gradient::gradient;
+pub use rain::RainState;
 pub use reactive::{Hit, ReactiveState};
 pub use ripple::{Pcg32, RippleState};
 pub use sparkle::SparkleState;

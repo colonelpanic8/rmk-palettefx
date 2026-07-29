@@ -23,9 +23,8 @@
 //!   time accumulator.
 //! - [`layout`]: [`LedLayout`](layout::LedLayout) trait describing the
 //!   (x, y) position of each LED in 0..=255 space.
-//! - [`effects`]: the six PaletteFx effects (Gradient, Flow, Ripple,
-//!   Sparkle, Vortex, Reactive). Stateful effects (Flow, Ripple, Sparkle,
-//!   Vortex, Reactive) carry their state in a struct; Gradient is a free
+//! - [`effects`]: the PaletteFx effects (Gradient, Flow, Ripple,
+//!   Sparkle, Vortex, Rain, Reactive). Stateful effects (all but Gradient) carry their state in a struct; Gradient is a free
 //!   function.
 //!
 //! ## Minimal example

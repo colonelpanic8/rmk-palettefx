@@ -5,13 +5,19 @@
 //! is active plus its state. [`Effect`] is that value: cycling resets the
 //! outgoing effect's state so each effect starts from its own time phase.
 
-use super::{FlowState, FrameParams, Pcg32, ReactiveState, RippleState, SparkleState, VortexState};
+use super::{
+    FlowState, FrameParams, Pcg32, RainState, ReactiveState, RippleState, SparkleState, VortexState,
+};
 use crate::color::Hsv;
 use crate::layout::LedLayout;
 
 /// Stream selector for the Ripple RNG; any odd constant works, this one is
 /// from the PCG reference implementation.
 const RIPPLE_RNG_STREAM: u64 = 0xA02B_DBF7_BB3C_0A7F;
+
+/// Stream selector for the Rain RNG; distinct from Ripple's so the two
+/// effects don't share drop-placement sequences when seeded alike.
+const RAIN_RNG_STREAM: u64 = 0x5851_F42D_4C95_7F2D;
 
 /// The currently active effect and its state. `HITS` sizes the Reactive
 /// effect's ring of remembered key presses.
@@ -21,14 +27,15 @@ pub enum Effect<const HITS: usize> {
     Vortex(VortexState),
     Sparkle(SparkleState),
     Ripple(RippleState, Pcg32),
+    Rain(RainState, Pcg32),
     Reactive(ReactiveState<HITS>),
 }
 
 impl<const HITS: usize> Effect<HITS> {
     /// Display names in stable index order; `index`/`from_index` and the
     /// next/prev cycle all agree with this ordering.
-    pub const NAMES: [&'static str; 6] = [
-        "Gradient", "Flow", "Vortex", "Sparkle", "Ripple", "Reactive",
+    pub const NAMES: [&'static str; 7] = [
+        "Gradient", "Flow", "Vortex", "Sparkle", "Ripple", "Rain", "Reactive",
     ];
 
     /// Stable index of the active effect into [`Self::NAMES`].
@@ -39,7 +46,8 @@ impl<const HITS: usize> Effect<HITS> {
             Self::Vortex(_) => 2,
             Self::Sparkle(_) => 3,
             Self::Ripple(_, _) => 4,
-            Self::Reactive(_) => 5,
+            Self::Rain(_, _) => 5,
+            Self::Reactive(_) => 6,
         }
     }
 
@@ -52,7 +60,8 @@ impl<const HITS: usize> Effect<HITS> {
             2 => Self::Vortex(VortexState::new()),
             3 => Self::Sparkle(SparkleState::new()),
             4 => Self::Ripple(RippleState::new(), ripple_rng(ripple_seed)),
-            5 => Self::Reactive(ReactiveState::new()),
+            5 => Self::Rain(RainState::new(), rain_rng(ripple_seed)),
+            6 => Self::Reactive(ReactiveState::new()),
             _ => return None,
         })
     }
@@ -65,6 +74,7 @@ impl<const HITS: usize> Effect<HITS> {
             Self::Vortex(s) => s.tick(layout, params, out),
             Self::Sparkle(s) => s.tick(layout, params, out),
             Self::Ripple(s, rng) => s.tick_with_rng(rng, layout, params, out),
+            Self::Rain(s, rng) => s.tick_with_rng(rng, layout, params, out),
             Self::Reactive(s) => s.tick(layout, params, out),
         }
     }
@@ -78,7 +88,8 @@ impl<const HITS: usize> Effect<HITS> {
             Self::Flow(_) => Self::Vortex(VortexState::new()),
             Self::Vortex(_) => Self::Sparkle(SparkleState::new()),
             Self::Sparkle(_) => Self::Ripple(RippleState::new(), ripple_rng(ripple_seed)),
-            Self::Ripple(_, _) => Self::Reactive(ReactiveState::new()),
+            Self::Ripple(_, _) => Self::Rain(RainState::new(), rain_rng(ripple_seed)),
+            Self::Rain(_, _) => Self::Reactive(ReactiveState::new()),
             Self::Reactive(_) => Self::Gradient,
         };
     }
@@ -87,7 +98,8 @@ impl<const HITS: usize> Effect<HITS> {
     pub fn prev(&mut self, ripple_seed: u64) {
         *self = match self {
             Self::Gradient => Self::Reactive(ReactiveState::new()),
-            Self::Reactive(_) => Self::Ripple(RippleState::new(), ripple_rng(ripple_seed)),
+            Self::Reactive(_) => Self::Rain(RainState::new(), rain_rng(ripple_seed)),
+            Self::Rain(_, _) => Self::Ripple(RippleState::new(), ripple_rng(ripple_seed)),
             Self::Ripple(_, _) => Self::Sparkle(SparkleState::new()),
             Self::Sparkle(_) => Self::Vortex(VortexState::new()),
             Self::Vortex(_) => Self::Flow(FlowState::new()),
@@ -110,4 +122,8 @@ impl<const HITS: usize> Effect<HITS> {
 
 fn ripple_rng(seed: u64) -> Pcg32 {
     Pcg32::new(seed, RIPPLE_RNG_STREAM)
+}
+
+fn rain_rng(seed: u64) -> Pcg32 {
+    Pcg32::new(seed, RAIN_RNG_STREAM)
 }

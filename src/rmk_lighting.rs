@@ -328,7 +328,7 @@ mod tests {
                 ..PaletteFxConfig::default()
             },
         );
-        source.effect = Effect::from_index(5, 0).unwrap();
+        source.effect = Effect::from_index(6, 0).unwrap();
         source
     }
 
