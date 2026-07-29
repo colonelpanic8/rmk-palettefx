@@ -16,7 +16,7 @@ rand_pcg = { version = "0.10", default-features = false }
 # `rmk-lighting` adapter dependencies. The lighting module only exists in the
 # colonelpanic8 fork; consumers building from a workspace should [patch] this
 # git source to their vendored copy.
-rmk = { git = "https://github.com/colonelpanic8/rmk", branch = "master", default-features = false, features = ["lighting"], optional = true }
+rmk = { git = "https://github.com/colonelpanic8/rmk", branch = "assembled", default-features = false, features = ["lighting"], optional = true }
 embassy-sync = { version = "0.8", optional = true }
 heapless = { version = "0.9", optional = true }
 

@@ -6,7 +6,8 @@
 //! outgoing effect's state so each effect starts from its own time phase.
 
 use super::{
-    FlowState, FrameParams, Pcg32, RainState, ReactiveState, RippleState, SparkleState, VortexState,
+    FlowState, FrameParams, Pcg32, RainParams, RainState, ReactiveState, RippleState, SparkleState,
+    VortexState,
 };
 use crate::color::Hsv;
 use crate::layout::LedLayout;
@@ -41,6 +42,36 @@ impl<const HITS: usize> Effect<HITS> {
     pub const NAMES: [&'static str; 8] = [
         "Gradient", "Flow", "Vortex", "Sparkle", "Ripple", "Rain", "Reactive", "Storm",
     ];
+
+    /// Stable index of the Rain effect into [`Self::NAMES`].
+    pub const RAIN_INDEX: u8 = 5;
+    /// Stable index of the Storm effect into [`Self::NAMES`].
+    pub const STORM_INDEX: u8 = 7;
+
+    /// Whether the effect at `index` renders a [`RainState`], and therefore
+    /// exposes the [`RainParams`] tuning. Rain and Storm both do; Storm's
+    /// background *is* the rain, so it takes the same knobs.
+    pub const fn uses_rain_params(index: u8) -> bool {
+        matches!(index, Self::RAIN_INDEX | Self::STORM_INDEX)
+    }
+
+    /// Retune the rain of whichever variant owns a [`RainState`]; a no-op
+    /// for every other effect.
+    pub const fn set_rain_params(&mut self, params: RainParams) {
+        match self {
+            Self::Rain(rain, _) | Self::Storm(rain, _, _) => rain.set_params(params),
+            _ => {}
+        }
+    }
+
+    /// The rain tuning of whichever variant owns a [`RainState`], or `None`
+    /// for effects that have none.
+    pub const fn rain_params(&self) -> Option<RainParams> {
+        match self {
+            Self::Rain(rain, _) | Self::Storm(rain, _, _) => Some(rain.params()),
+            _ => None,
+        }
+    }
 
     /// Stable index of the active effect into [`Self::NAMES`].
     pub const fn index(&self) -> u8 {

@@ -14,21 +14,142 @@ use crate::layout::LedLayout;
 use crate::math::{scale8, scale16by8};
 use crate::palette::interp_color;
 
-/// Active drops. Kept small so the board reads as sparse: with the spawn
-/// cadence below, typically 3-5 drops are visible at once.
-const RAIN_DROPS: usize = 6;
-/// Base delay between spawns; a per-spawn random jitter of 0..=510 ms is
-/// added on top so drops don't fall in lockstep.
-const RAIN_SPAWN_INTERVAL_MS: u32 = 300;
-/// Trail length behind the head, in 0..=255 y-grid units.
-const TRAIL_LEN: u16 = 128;
-/// Half-width of the column a drop illuminates, in 0..=255 x-grid units.
-/// On a Glove80 (~10 columns per half mapped across 0..=255) this covers
-/// roughly one key column with soft edges on the neighbours.
-const COL_HALF_WIDTH: u16 = 14;
-/// The head starts this far above y=0 and the drop dies once the whole
-/// trail has cleared y=255, so drops fade in and out at the board edges.
-const OVERSHOOT: i32 = TRAIL_LEN as i32;
+/// Drop slots the state always carries. [`RainParams::drops`] caps how many
+/// of them spawn, so the array is sized for the largest allowed setting.
+const RAIN_DROPS: usize = 8;
+
+/// Runtime tuning for the Rain effect (and for the rain background of
+/// Storm). Every field is a `u8` so the whole struct maps directly onto a
+/// host-visible parameter list; [`RainParams::DEFAULT`] reproduces the
+/// values these knobs replaced, so an untouched board looks unchanged.
+///
+/// Values are validated by [`RainParams::set`] against the `*_MIN`/`*_MAX`
+/// bounds below; the renderer assumes an in-range struct (in particular
+/// non-zero `trail_len` and `column_half_width`, which it divides by).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct RainParams {
+    /// Drop slots allowed to spawn, 1..=8. Kept small so the board reads as
+    /// sparse: at the default spawn cadence typically 3-5 drops are visible.
+    pub drops: u8,
+    /// Base delay between spawns, in units of 10 ms (so 30 = 300 ms). A
+    /// per-spawn random jitter of 0..=510 ms is added on top so drops don't
+    /// fall in lockstep.
+    pub spawn_interval: u8,
+    /// Trail length behind the head, in 0..=255 y-grid units.
+    pub trail_len: u8,
+    /// Half-width of the column a drop illuminates, in 0..=255 x-grid units.
+    /// On a Glove80 (~10 columns per half mapped across 0..=255) the default
+    /// covers roughly one key column with soft edges on the neighbours.
+    pub column_half_width: u8,
+}
+
+impl RainParams {
+    /// Milliseconds per unit of [`Self::spawn_interval`].
+    pub const SPAWN_INTERVAL_STEP_MS: u32 = 10;
+
+    pub const DROPS_MIN: u8 = 1;
+    pub const DROPS_MAX: u8 = RAIN_DROPS as u8;
+    pub const SPAWN_INTERVAL_MIN: u8 = 1;
+    pub const SPAWN_INTERVAL_MAX: u8 = 255;
+    pub const TRAIL_LEN_MIN: u8 = 16;
+    pub const TRAIL_LEN_MAX: u8 = 255;
+    pub const COLUMN_HALF_WIDTH_MIN: u8 = 4;
+    pub const COLUMN_HALF_WIDTH_MAX: u8 = 64;
+
+    /// The tuned defaults. Also the values advertised as each parameter's
+    /// `default` to hosts.
+    pub const DEFAULT: Self = Self {
+        drops: 6,
+        spawn_interval: 30,
+        trail_len: 128,
+        column_half_width: 14,
+    };
+
+    /// Number of parameters, i.e. the valid range of the indices accepted by
+    /// [`Self::get`] and [`Self::set`].
+    pub const COUNT: u8 = 4;
+
+    /// Host-facing parameter names, in index order. `Spawn` carries its
+    /// encoding in the name because the value is not milliseconds.
+    pub const NAMES: [&'static str; Self::COUNT as usize] =
+        ["Drops", "Spawn x10ms", "Trail", "Width"];
+
+    /// Inclusive lower bound of each parameter, in index order.
+    pub const MINS: [u8; Self::COUNT as usize] = [
+        Self::DROPS_MIN,
+        Self::SPAWN_INTERVAL_MIN,
+        Self::TRAIL_LEN_MIN,
+        Self::COLUMN_HALF_WIDTH_MIN,
+    ];
+
+    /// Inclusive upper bound of each parameter, in index order.
+    pub const MAXES: [u8; Self::COUNT as usize] = [
+        Self::DROPS_MAX,
+        Self::SPAWN_INTERVAL_MAX,
+        Self::TRAIL_LEN_MAX,
+        Self::COLUMN_HALF_WIDTH_MAX,
+    ];
+
+    /// Default of each parameter, in index order.
+    pub const DEFAULTS: [u8; Self::COUNT as usize] = [
+        Self::DEFAULT.drops,
+        Self::DEFAULT.spawn_interval,
+        Self::DEFAULT.trail_len,
+        Self::DEFAULT.column_half_width,
+    ];
+
+    /// Value of one parameter, or `None` when `index` is out of range.
+    pub const fn get(&self, index: u8) -> Option<u8> {
+        Some(match index {
+            0 => self.drops,
+            1 => self.spawn_interval,
+            2 => self.trail_len,
+            3 => self.column_half_width,
+            _ => return None,
+        })
+    }
+
+    /// Set one parameter. Returns `false` — leaving `self` untouched — when
+    /// `index` is out of range or `value` falls outside that parameter's
+    /// advertised bounds.
+    pub const fn set(&mut self, index: u8, value: u8) -> bool {
+        let i = index as usize;
+        if i >= Self::COUNT as usize || value < Self::MINS[i] || value > Self::MAXES[i] {
+            return false;
+        }
+        match index {
+            0 => self.drops = value,
+            1 => self.spawn_interval = value,
+            2 => self.trail_len = value,
+            3 => self.column_half_width = value,
+            _ => return false,
+        }
+        true
+    }
+
+    /// Base spawn delay in milliseconds.
+    const fn spawn_interval_ms(&self) -> u32 {
+        self.spawn_interval as u32 * Self::SPAWN_INTERVAL_STEP_MS
+    }
+
+    /// Drop slots that may spawn, clamped into the supported range so a
+    /// hand-built struct cannot index past the drop array.
+    const fn active_drops(&self) -> usize {
+        if self.drops < Self::DROPS_MIN {
+            Self::DROPS_MIN as usize
+        } else if self.drops > Self::DROPS_MAX {
+            RAIN_DROPS
+        } else {
+            self.drops as usize
+        }
+    }
+}
+
+impl Default for RainParams {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
 
 #[derive(Copy, Clone, Default)]
 struct Drop {
@@ -43,6 +164,7 @@ pub struct RainState {
     drops_tail: usize,
     next_spawn_ms: u32,
     initialized: bool,
+    params: RainParams,
 }
 
 impl Default for RainState {
@@ -53,6 +175,12 @@ impl Default for RainState {
 
 impl RainState {
     pub const fn new() -> Self {
+        Self::with_params(RainParams::DEFAULT)
+    }
+
+    /// State pre-tuned with `params`; see [`RainState::set_params`] for
+    /// changing them on a running effect.
+    pub const fn with_params(params: RainParams) -> Self {
         Self {
             drops: [Drop {
                 spawn_ms: 0,
@@ -62,7 +190,24 @@ impl RainState {
             drops_tail: 0,
             next_spawn_ms: 0,
             initialized: false,
+            params,
         }
+    }
+
+    /// Retune a running effect. Drops already in flight keep falling with
+    /// the new trail and column geometry; lowering the drop count simply
+    /// stops the surplus slots from respawning once they expire.
+    pub const fn set_params(&mut self, params: RainParams) {
+        self.params = params;
+        let active = params.active_drops();
+        if self.drops_tail >= active {
+            self.drops_tail = 0;
+        }
+    }
+
+    /// The tuning currently in effect.
+    pub const fn params(&self) -> RainParams {
+        self.params
     }
 
     /// State with exactly one drop and spawning suppressed, so tests can
@@ -110,6 +255,12 @@ impl RainState {
         F: FnMut(usize, u8, u8) -> u8,
     {
         let count = layout.count();
+        let active_drops = self.params.active_drops();
+        let trail_len = self.params.trail_len.max(1) as u16;
+        let col_half_width = self.params.column_half_width.max(1) as u16;
+        // The head starts this far above y=0 and the drop dies once the whole
+        // trail has cleared y=255, so drops fade in and out at the board edges.
+        let overshoot = trail_len as i32;
 
         if !self.initialized {
             self.initialized = true;
@@ -127,10 +278,10 @@ impl RainState {
                 x: rng(),
                 active: true,
             };
-            self.drops_tail = (slot + 1) % RAIN_DROPS;
+            self.drops_tail = (slot + 1) % active_drops;
             self.next_spawn_ms = params
                 .timer_ms
-                .wrapping_add(RAIN_SPAWN_INTERVAL_MS + (rng() as u32) * 2);
+                .wrapping_add(self.params.spawn_interval_ms() + (rng() as u32) * 2);
         }
 
         // Head y-position per drop, in an extended coordinate so the head
@@ -148,8 +299,8 @@ impl RainState {
             // ~2x Ripple's expansion rate so drops read as falling rather
             // than drifting; speed=128 crosses the board in about a second.
             let tick = scale16by8(elapsed as u16, 1 + params.speed / 4) as i32;
-            let y = tick / 2 - OVERSHOOT;
-            if y > 255 + OVERSHOOT {
+            let y = tick / 2 - overshoot;
+            if y > 255 + overshoot {
                 drop.active = false;
                 continue;
             }
@@ -169,18 +320,18 @@ impl RainState {
                 } else {
                     drop.x - lx
                 } as u16;
-                if dx >= COL_HALF_WIDTH {
+                if dx >= col_half_width {
                     continue;
                 }
                 // Distance behind the head: 0 at the head itself, growing
                 // as the head falls past this LED. LEDs the head hasn't
                 // reached yet stay dark.
                 let behind = head - ly as i32;
-                if !(0..=TRAIL_LEN as i32).contains(&behind) {
+                if !(0..=trail_len as i32).contains(&behind) {
                     continue;
                 }
-                let along = 255 - (behind as u16 * 255 / TRAIL_LEN) as u8;
-                let across = 255 - (dx * 255 / COL_HALF_WIDTH) as u8;
+                let along = 255 - (behind as u16 * 255 / trail_len) as u8;
+                let across = 255 - (dx * 255 / col_half_width) as u8;
                 intensity = intensity.max(scale8(along, across));
             }
 
@@ -282,6 +433,135 @@ mod tests {
             }
         }
         panic!("drop never lit two LEDs");
+    }
+
+    /// The advertised defaults must reproduce the tuning that used to be
+    /// compiled in, so adding the parameters changed nothing on a board
+    /// that never touches them.
+    #[test]
+    fn defaults_match_the_previously_hardcoded_tuning() {
+        let params = RainParams::DEFAULT;
+        assert_eq!(params.drops, 6);
+        assert_eq!(params.spawn_interval_ms(), 300);
+        assert_eq!(params.trail_len, 128);
+        assert_eq!(params.column_half_width, 14);
+        assert_eq!(RainState::new().params(), params);
+        assert_eq!(
+            RainParams::DEFAULTS,
+            [
+                params.drops,
+                params.spawn_interval,
+                params.trail_len,
+                params.column_half_width
+            ]
+        );
+    }
+
+    #[test]
+    fn out_of_range_parameters_are_declined_without_mutating() {
+        let mut params = RainParams::DEFAULT;
+        assert!(!params.set(0, RainParams::DROPS_MAX + 1));
+        assert!(!params.set(2, RainParams::TRAIL_LEN_MIN - 1));
+        assert!(!params.set(3, RainParams::COLUMN_HALF_WIDTH_MAX + 1));
+        assert!(!params.set(RainParams::COUNT, 1));
+        assert_eq!(params, RainParams::DEFAULT);
+        assert_eq!(params.get(RainParams::COUNT), None);
+
+        assert!(params.set(2, RainParams::TRAIL_LEN_MIN));
+        assert_eq!(params.get(2), Some(RainParams::TRAIL_LEN_MIN));
+    }
+
+    /// Peak simultaneously lit LEDs over a time sweep, a stand-in for "how
+    /// much of the board the effect covers at once".
+    fn peak_lit<const N: usize>(
+        state: &mut RainState,
+        layout: &SliceLayout<'_>,
+        mut rng: impl FnMut() -> u8,
+    ) -> usize {
+        let mut out = [Hsv::default(); N];
+        let mut peak = 0;
+        for t in (0..8000).step_by(20) {
+            state.tick(layout, params(t, 128), &mut rng, &mut out);
+            peak = peak.max(lit(&out));
+        }
+        peak
+    }
+
+    /// A longer trail keeps LEDs the head has already passed lit, so more of
+    /// a sparse column glows at once.
+    #[test]
+    fn trail_length_parameter_changes_how_much_of_a_column_glows() {
+        let layout = SliceLayout::new(COLUMN);
+
+        let mut short = RainState::with_single_drop(0, 0);
+        short.set_params(RainParams {
+            trail_len: RainParams::TRAIL_LEN_MIN,
+            ..RainParams::DEFAULT
+        });
+        // The LEDs are 64 grid units apart, so a 16-unit trail never spans
+        // two of them.
+        assert_eq!(peak_lit::<5>(&mut short, &layout, || 0), 1);
+
+        let mut long = RainState::with_single_drop(0, 0);
+        long.set_params(RainParams {
+            trail_len: RainParams::TRAIL_LEN_MAX,
+            ..RainParams::DEFAULT
+        });
+        assert!(peak_lit::<5>(&mut long, &layout, || 0) > 1);
+    }
+
+    /// Raising the drop count puts more independent columns in flight.
+    #[test]
+    fn drop_count_parameter_bounds_concurrent_drops() {
+        // One LED per drop column, far enough apart that a drop lights only
+        // its own.
+        const ROW: &[(u8, u8)] = &[
+            (0, 128),
+            (32, 128),
+            (64, 128),
+            (96, 128),
+            (128, 128),
+            (160, 128),
+            (192, 128),
+            (224, 128),
+        ];
+        let layout = SliceLayout::new(ROW);
+        // Each spawn draws two bytes: the column, then the jitter. Walk the
+        // columns and keep the jitter at zero so the drop count is the only
+        // limit on how many drops are in flight.
+        let column_walk = || {
+            let mut draws = 0u32;
+            move || {
+                draws += 1;
+                if draws % 2 == 1 {
+                    (draws / 2 % 8) as u8 * 32
+                } else {
+                    0
+                }
+            }
+        };
+
+        let mut sparse = RainState::new();
+        sparse.set_params(RainParams {
+            drops: RainParams::DROPS_MIN,
+            spawn_interval: 1,
+            ..RainParams::DEFAULT
+        });
+        let sparse_peak = peak_lit::<8>(&mut sparse, &layout, column_walk());
+
+        let mut dense = RainState::new();
+        dense.set_params(RainParams {
+            drops: RainParams::DROPS_MAX,
+            spawn_interval: 1,
+            ..RainParams::DEFAULT
+        });
+        let dense_peak = peak_lit::<8>(&mut dense, &layout, column_walk());
+
+        assert_eq!(sparse_peak, 1);
+        assert!(
+            dense_peak > sparse_peak,
+            "eight drops lit {dense_peak} LEDs, one drop lit {sparse_peak}"
+        );
     }
 
     #[test]

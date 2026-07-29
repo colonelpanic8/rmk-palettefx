@@ -16,7 +16,7 @@ mod vortex;
 pub use cycle::Effect;
 pub use flow::FlowState;
 pub use gradient::gradient;
-pub use rain::RainState;
+pub use rain::{RainParams, RainState};
 pub use reactive::{Hit, ReactiveState};
 pub use ripple::{Pcg32, RippleState};
 pub use sparkle::SparkleState;

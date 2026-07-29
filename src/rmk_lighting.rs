@@ -18,7 +18,8 @@ use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use heapless::Deque;
 use rmk::lighting::compositor::{
-    Contribution, ExtensionDescriptor, ExtensionState, LightingSource, RenderInput,
+    Contribution, ExtensionDescriptor, ExtensionParamSpec, ExtensionState, LightingSource,
+    RenderInput,
 };
 use rmk::lighting::{EffectSample, LedSlot, Rgb8};
 use rmk::types::action::LightAction;
@@ -26,7 +27,7 @@ use rmk::types::action::LightAction;
 use rmk::lighting::topology::LightingTopology;
 
 use crate::color::{Hsv, hsv_to_rgb};
-use crate::effects::{Effect, FrameParams};
+use crate::effects::{Effect, FrameParams, RainParams};
 use crate::layout::LedLayout;
 use crate::palette::{BUILTIN_PALETTE_NAMES, BUILTIN_PALETTES};
 
@@ -115,6 +116,50 @@ impl Default for PaletteFxConfig {
     }
 }
 
+/// Number of effects in the cycle; sizes the per-effect parameter tables.
+/// `Effect::NAMES` is the same list for every `HITS`, so the smallest
+/// instantiation stands in for all of them in const position.
+const EFFECT_COUNT: usize = Effect::<1>::NAMES.len();
+
+/// The Rain tuning knobs as RMK parameter specs, derived from the effect's
+/// own bounds so the advertised defaults cannot drift from
+/// [`RainParams::DEFAULT`].
+static RAIN_PARAM_SPECS: [ExtensionParamSpec; RainParams::COUNT as usize] = rain_param_specs();
+
+const fn rain_param_specs() -> [ExtensionParamSpec; RainParams::COUNT as usize] {
+    let mut specs = [ExtensionParamSpec {
+        name: "",
+        min: 0,
+        max: 0,
+        default: 0,
+    }; RainParams::COUNT as usize];
+    let mut i = 0;
+    while i < specs.len() {
+        specs[i] = ExtensionParamSpec {
+            name: RainParams::NAMES[i],
+            min: RainParams::MINS[i],
+            max: RainParams::MAXES[i],
+            default: RainParams::DEFAULTS[i],
+        };
+        i += 1;
+    }
+    specs
+}
+
+/// Per-effect parameter rows, indexed exactly like `Effect::NAMES`. Rain and
+/// Storm share one row: Storm's background is the rain, so it takes the same
+/// knobs. Every other effect advertises none.
+static EFFECT_PARAMS: [&[ExtensionParamSpec]; EFFECT_COUNT] = [
+    &[],               // Gradient
+    &[],               // Flow
+    &[],               // Vortex
+    &[],               // Sparkle
+    &[],               // Ripple
+    &RAIN_PARAM_SPECS, // Rain
+    &[],               // Reactive
+    &RAIN_PARAM_SPECS, // Storm
+];
+
 /// Pending Reactive key-hit LED indices. `HITS` bounds how many un-drained
 /// presses are remembered between frames.
 pub struct HitQueue<const HITS: usize> {
@@ -152,6 +197,10 @@ pub struct PaletteFxSource<L: LedLayout, const N: usize, const HITS: usize = 16>
     val: u8,
     last_nonzero_val: u8,
     speed: u8,
+    /// Per-effect parameter values, indexed like `Effect::NAMES`. Held here
+    /// rather than in the effect state so tuning survives cycling away from
+    /// an effect and back; rows for effects without parameters are unused.
+    rain_params: [RainParams; EFFECT_COUNT],
     frame: [Hsv; N],
     last_now_ms: u64,
 }
@@ -179,8 +228,19 @@ impl<L: LedLayout, const N: usize, const HITS: usize> PaletteFxSource<L, N, HITS
             last_nonzero_val,
             speed: config.initial_speed,
             config,
+            rain_params: [RainParams::DEFAULT; EFFECT_COUNT],
             frame: [Hsv::default(); N],
             last_now_ms: 0,
+        }
+    }
+
+    /// Push the stored tuning of the active effect into its freshly built
+    /// state. Called after every effect switch, since `Effect::from_index`
+    /// and the cycle keys both hand back default-tuned state.
+    fn sync_effect_params(&mut self) {
+        let index = self.effect.index() as usize;
+        if let Some(&params) = self.rain_params.get(index) {
+            self.effect.set_rain_params(params);
         }
     }
 
@@ -248,8 +308,14 @@ impl<L: LedLayout, const N: usize, const HITS: usize, Context> LightingSource<Rg
                     self.val = 0;
                 }
             }
-            LightAction::RgbModeForward => self.effect.next(self.ripple_seed()),
-            LightAction::RgbModeReverse => self.effect.prev(self.ripple_seed()),
+            LightAction::RgbModeForward => {
+                self.effect.next(self.ripple_seed());
+                self.sync_effect_params();
+            }
+            LightAction::RgbModeReverse => {
+                self.effect.prev(self.ripple_seed());
+                self.sync_effect_params();
+            }
             LightAction::RgbHui => self.palette_idx = (self.palette_idx + 1) % n,
             LightAction::RgbHud => self.palette_idx = (self.palette_idx + n - 1) % n,
             LightAction::RgbVai => {
@@ -276,6 +342,7 @@ impl<L: LedLayout, const N: usize, const HITS: usize, Context> LightingSource<Rg
         Some(ExtensionDescriptor {
             effects: &Effect::<HITS>::NAMES,
             palettes: &BUILTIN_PALETTE_NAMES,
+            params: &EFFECT_PARAMS,
         })
     }
 
@@ -299,6 +366,7 @@ impl<L: LedLayout, const N: usize, const HITS: usize, Context> LightingSource<Rg
                 return false;
             };
             self.effect = effect;
+            self.sync_effect_params();
         }
         self.palette_idx = state.palette as usize;
         self.val = state.value;
@@ -306,6 +374,32 @@ impl<L: LedLayout, const N: usize, const HITS: usize, Context> LightingSource<Rg
             self.last_nonzero_val = state.value;
         }
         self.speed = state.speed;
+        true
+    }
+
+    fn extension_param(&self, effect: u8, index: u8) -> Option<u8> {
+        if !Effect::<HITS>::uses_rain_params(effect) {
+            return None;
+        }
+        self.rain_params.get(effect as usize)?.get(index)
+    }
+
+    fn apply_extension_param(&mut self, effect: u8, index: u8, value: u8) -> bool {
+        if !Effect::<HITS>::uses_rain_params(effect) {
+            return false;
+        }
+        let Some(params) = self.rain_params.get_mut(effect as usize) else {
+            return false;
+        };
+        // `set` is the range authority: it declines out-of-range values
+        // without mutating, so a rejected set leaves the source untouched.
+        if !params.set(index, value) {
+            return false;
+        }
+        let params = *params;
+        if effect == self.effect.index() {
+            self.effect.set_rain_params(params);
+        }
         true
     }
 }
@@ -373,6 +467,189 @@ mod tests {
                 .value,
             255
         );
+    }
+
+    /// Every effect that consumes rain tuning must advertise the rain row,
+    /// and no other effect may: otherwise a host offers knobs that do
+    /// nothing, or hides ones that work.
+    #[test]
+    fn advertised_parameter_rows_match_the_effects_that_use_them() {
+        let source = reactive(&NO_HITS);
+        let descriptor =
+            <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::extension_descriptor(&source)
+                .unwrap();
+        assert_eq!(descriptor.params.len(), descriptor.effects.len());
+        for effect in 0..descriptor.effects.len() as u8 {
+            let specs = descriptor.effect_params(effect).unwrap();
+            assert_eq!(
+                !specs.is_empty(),
+                Effect::<1>::uses_rain_params(effect),
+                "effect {effect} parameter row disagrees with its state"
+            );
+        }
+        assert!(
+            descriptor
+                .effect_params(descriptor.effects.len() as u8)
+                .is_none()
+        );
+    }
+
+    /// The descriptor's advertised defaults are the tuned values, and a
+    /// fresh source reads those values back.
+    #[test]
+    fn rain_parameters_default_to_the_tuned_values() {
+        let source = reactive(&NO_HITS);
+        let descriptor =
+            <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::extension_descriptor(&source)
+                .unwrap();
+        for effect in [Effect::<1>::RAIN_INDEX, Effect::<1>::STORM_INDEX] {
+            let specs = descriptor.effect_params(effect).unwrap();
+            assert_eq!(specs.len(), RainParams::COUNT as usize);
+            for (index, spec) in specs.iter().enumerate() {
+                assert_eq!(spec.name, RainParams::NAMES[index]);
+                assert_eq!(spec.min, RainParams::MINS[index]);
+                assert_eq!(spec.max, RainParams::MAXES[index]);
+                assert_eq!(spec.default, RainParams::DEFAULTS[index]);
+                assert_eq!(
+                    <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::extension_param(
+                        &source,
+                        effect,
+                        index as u8,
+                    ),
+                    Some(spec.default),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parameter_sets_round_trip_and_survive_effect_switching() {
+        let mut source = reactive(&NO_HITS);
+        let rain = Effect::<1>::RAIN_INDEX;
+
+        assert!(
+            <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::apply_extension_param(
+                &mut source,
+                rain,
+                2,
+                200,
+            )
+        );
+        assert_eq!(
+            <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::extension_param(
+                &source, rain, 2
+            ),
+            Some(200),
+        );
+        // Rain and Storm keep separate values even though they share specs.
+        assert_eq!(
+            <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::extension_param(
+                &source,
+                Effect::<1>::STORM_INDEX,
+                2,
+            ),
+            Some(RainParams::DEFAULT.trail_len),
+        );
+
+        // Cycle all the way around: the freshly built Rain state must be
+        // retuned from the source's stored values, not left at defaults.
+        for _ in 0..Effect::<1>::NAMES.len() {
+            assert!(
+                <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::handle_light_action(
+                    &mut source,
+                    LightAction::RgbModeForward,
+                )
+            );
+        }
+        assert!(
+            <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::apply_extension_state(
+                &mut source,
+                ExtensionState {
+                    effect: rain,
+                    palette: 0,
+                    value: 255,
+                    speed: 128,
+                },
+            )
+        );
+        assert_eq!(
+            <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::extension_param(
+                &source, rain, 2
+            ),
+            Some(200),
+        );
+        assert_eq!(
+            source.effect.rain_params(),
+            Some(source.rain_params[rain as usize])
+        );
+    }
+
+    #[test]
+    fn out_of_range_and_unknown_parameters_are_declined_unchanged() {
+        let mut source = reactive(&NO_HITS);
+        let rain = Effect::<1>::RAIN_INDEX;
+        let before = source.rain_params;
+
+        // Out of range for its spec, an unknown index, and an effect with no
+        // parameters at all.
+        for (effect, index, value) in [
+            (rain, 0, RainParams::DROPS_MAX + 1),
+            (rain, RainParams::COUNT, 1),
+            (0, 0, 1),
+            (Effect::<1>::NAMES.len() as u8, 0, 1),
+        ] {
+            assert!(
+                !<PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::apply_extension_param(
+                    &mut source,
+                    effect,
+                    index,
+                    value,
+                ),
+                "effect {effect} index {index} value {value} should be declined"
+            );
+        }
+        assert_eq!(source.rain_params, before);
+        assert_eq!(
+            <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::extension_param(&source, 0, 0),
+            None,
+        );
+    }
+
+    /// A parameter set on the active effect reaches the live effect state,
+    /// not just the source's table.
+    #[test]
+    fn parameter_sets_change_what_the_active_effect_renders() {
+        static WIDE: [(u8, u8); 1] = [(0, 128)];
+        let build = || {
+            let mut source: PaletteFxSource<SliceLayout<'static>, 1, 1> = PaletteFxSource::new(
+                SliceLayout::new(&WIDE),
+                &NO_HITS,
+                PaletteFxConfig::default(),
+            );
+            source.effect = Effect::from_index(Effect::<1>::RAIN_INDEX, 0).unwrap();
+            source
+        };
+
+        let mut narrow = build();
+        let mut wide = build();
+        // A drop lands at x=128; only the wider column reaches the LED at
+        // x=0. (Both sources share the seed, so they place the same drops.)
+        assert!(
+            <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::apply_extension_param(
+                &mut wide,
+                Effect::<1>::RAIN_INDEX,
+                3,
+                RainParams::COLUMN_HALF_WIDTH_MAX,
+            )
+        );
+
+        let mut differed = false;
+        for t in (0..8000).step_by(40) {
+            narrow.tick_frame(t);
+            wide.tick_frame(t);
+            differed |= narrow.frame != wide.frame;
+        }
+        assert!(differed, "column width never changed the rendered frame");
     }
 
     #[test]
