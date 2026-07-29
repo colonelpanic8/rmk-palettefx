@@ -1,6 +1,8 @@
-//! RAIN: sparse particles falling down the board, each with a fading trail.
+//! RAIN: particles falling down the board, each with a fading trail.
 //!
-//! A few drops are active at any time. Each drop owns a column (a random
+//! How busy it looks is set by [`RainParams`]: the spawn cadence and the
+//! number of slots together decide how many drops are airborne, from a few
+//! sparse streaks to a downpour. Each drop owns a column (a random
 //! x position) and a head that sweeps from above the board to below it;
 //! LEDs near the head light at full palette value and LEDs the head has
 //! already passed form a trail that decays with distance behind the head,
@@ -16,24 +18,34 @@ use crate::palette::interp_color;
 
 /// Drop slots the state always carries. [`RainParams::drops`] caps how many
 /// of them spawn, so the array is sized for the largest allowed setting.
-const RAIN_DROPS: usize = 8;
+/// Rendering costs one bounds check per slot per LED, which at this size is
+/// still trivial next to the per-frame palette work.
+const RAIN_DROPS: usize = 32;
+
+/// A spawn deadline further in the past than this restarts from the current
+/// time instead of firing every slot at once. Without it, switching to Rain
+/// after the clock has run on would dump the whole array in one frame and
+/// the drops would fall in lockstep until they aged out.
+const CADENCE_RESYNC_MS: u32 = 2_000;
 
 /// Runtime tuning for the Rain effect (and for the rain background of
 /// Storm). Every field is a `u8` so the whole struct maps directly onto a
 /// host-visible parameter list; [`RainParams::DEFAULT`] reproduces the
-/// values these knobs replaced, so an untouched board looks unchanged.
+/// values a board boots with when it has no persisted selection.
 ///
 /// Values are validated by [`RainParams::set`] against the `*_MIN`/`*_MAX`
 /// bounds below; the renderer assumes an in-range struct (in particular
 /// non-zero `trail_len` and `column_half_width`, which it divides by).
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct RainParams {
-    /// Drop slots allowed to spawn, 1..=8. Kept small so the board reads as
-    /// sparse: at the default spawn cadence typically 3-5 drops are visible.
+    /// Drop slots allowed to spawn, 1..=32. How many are actually airborne
+    /// is the spawn cadence times the fall time, so this is the ceiling
+    /// rather than the count.
     pub drops: u8,
-    /// Base delay between spawns, in units of 10 ms (so 30 = 300 ms). A
-    /// per-spawn random jitter of 0..=510 ms is added on top so drops don't
-    /// fall in lockstep.
+    /// Base delay between spawns, in units of 10 ms (so 30 = 300 ms). Jitter
+    /// of up to half this delay is added per spawn so drops don't fall in
+    /// lockstep; being proportional, it breaks up a slow cadence without
+    /// putting a floor under a fast one.
     pub spawn_interval: u8,
     /// Trail length behind the head, in 0..=255 y-grid units.
     pub trail_len: u8,
@@ -132,6 +144,15 @@ impl RainParams {
         self.spawn_interval as u32 * Self::SPAWN_INTERVAL_STEP_MS
     }
 
+    /// One spawn delay: the base plus up to half of it, chosen from `entropy`.
+    /// Scaling the jitter with the base keeps drops out of lockstep at every
+    /// cadence; a fixed spread would swamp a short interval and cap how
+    /// densely the board can rain.
+    const fn spawn_delay_ms(&self, entropy: u8) -> u32 {
+        let base = self.spawn_interval_ms();
+        base + (base * entropy as u32) / 512
+    }
+
     /// Drop slots that may spawn, clamped into the supported range so a
     /// hand-built struct cannot index past the drop array.
     const fn active_drops(&self) -> usize {
@@ -210,6 +231,13 @@ impl RainState {
         self.params
     }
 
+    /// Airborne drops; lets a test assert density without inferring it from
+    /// lit LEDs, which a shared column would undercount.
+    #[cfg(test)]
+    fn active_drop_count(&self) -> usize {
+        self.drops.iter().filter(|d| d.active).count()
+    }
+
     /// State with exactly one drop and spawning suppressed, so tests can
     /// observe a single trail without other drops overlapping it.
     #[cfg(test)]
@@ -269,9 +297,22 @@ impl RainState {
 
         // Spawn a new drop if the slot at `drops_tail` is free and the
         // inter-drop timer has elapsed (wraparound-safe, as in Ripple).
-        if !self.drops[self.drops_tail].active
-            && params.timer_ms.wrapping_sub(self.next_spawn_ms) < u32::MAX / 2
+        let due = |deadline: u32| params.timer_ms.wrapping_sub(deadline) < u32::MAX / 2;
+
+        // A cadence shorter than the frame interval owes more than one drop
+        // per tick, so spawn until the backlog is cleared instead of once per
+        // frame -- otherwise the frame rate, not the parameter, sets the
+        // ceiling on density. Each pass fills one slot, so `active_drops`
+        // bounds the loop.
+        if due(self.next_spawn_ms)
+            && params.timer_ms.wrapping_sub(self.next_spawn_ms) > CADENCE_RESYNC_MS
         {
+            self.next_spawn_ms = params.timer_ms;
+        }
+        for _ in 0..active_drops {
+            if self.drops[self.drops_tail].active || !due(self.next_spawn_ms) {
+                break;
+            }
             let slot = self.drops_tail;
             self.drops[slot] = Drop {
                 spawn_ms: params.timer_ms,
@@ -279,9 +320,11 @@ impl RainState {
                 active: true,
             };
             self.drops_tail = (slot + 1) % active_drops;
-            self.next_spawn_ms = params
-                .timer_ms
-                .wrapping_add(self.params.spawn_interval_ms() + (rng() as u32) * 2);
+            // Advance from the deadline, not from now, so a cadence finer
+            // than the frame interval keeps its average rate.
+            self.next_spawn_ms = self
+                .next_spawn_ms
+                .wrapping_add(self.params.spawn_delay_ms(rng()).max(1));
         }
 
         // Head y-position per drop, in an extended coordinate so the head
@@ -508,6 +551,66 @@ mod tests {
             ..RainParams::DEFAULT
         });
         assert!(peak_lit::<5>(&mut long, &layout, || 0) > 1);
+    }
+
+    /// The point of the ceiling being 32 rather than a handful: a fast cadence
+    /// has to actually fill the board. The frame interval must not cap it
+    /// either -- at 10 ms between spawns a 40 ms tick owes four drops, so
+    /// spawning once per tick would silently pin density to the frame rate.
+    #[test]
+    fn a_cadence_finer_than_the_tick_still_fills_every_slot() {
+        const POS: &[(u8, u8)] = &[(0, 0)];
+        let layout = SliceLayout::new(POS);
+        let mut out = [Hsv::default(); 1];
+
+        let mut state = RainState::with_params(RainParams {
+            drops: RainParams::DROPS_MAX,
+            spawn_interval: 1, // 10 ms, far below the 40 ms frame interval
+            ..RainParams::DEFAULT
+        });
+
+        // Two 40 ms frames: eight spawns are owed, so a once-per-tick spawner
+        // would have managed two.
+        state.tick(&layout, params(0, 128), || 0, &mut out);
+        state.tick(&layout, params(40, 128), || 0, &mut out);
+        state.tick(&layout, params(80, 128), || 0, &mut out);
+        assert!(
+            state.active_drop_count() >= 8,
+            "expected the backlog to be spawned, got {}",
+            state.active_drop_count()
+        );
+
+        // The ceiling still holds.
+        for t in (120..4000).step_by(40) {
+            state.tick(&layout, params(t, 128), || 0, &mut out);
+            assert!(state.active_drop_count() <= RainParams::DROPS_MAX as usize);
+        }
+    }
+
+    /// Jitter scales with the cadence instead of being a fixed spread, so a
+    /// short interval is not swamped by it. A fixed 0..510 ms spread put an
+    /// unavoidable floor of a quarter second under the average gap.
+    #[test]
+    fn spawn_jitter_stays_proportional_to_the_cadence() {
+        let fast = RainParams {
+            spawn_interval: 1,
+            ..RainParams::DEFAULT
+        };
+        assert_eq!(fast.spawn_delay_ms(0), 10);
+        assert!(
+            fast.spawn_delay_ms(255) <= 15,
+            "jitter must not swamp 10 ms"
+        );
+
+        let slow = RainParams {
+            spawn_interval: 100,
+            ..RainParams::DEFAULT
+        };
+        assert_eq!(slow.spawn_delay_ms(0), 1000);
+        assert!(
+            slow.spawn_delay_ms(255) > 1200,
+            "a slow cadence still needs real spread"
+        );
     }
 
     /// Raising the drop count puts more independent columns in flight.
