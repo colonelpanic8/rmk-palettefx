@@ -31,6 +31,9 @@ pub struct RippleState {
     drops: [Droplet; RIPPLE_DROPS],
     drops_tail: usize,
     next_spawn_ms: u32,
+    /// The animation clock at the previous frame, so a clock that jumps
+    /// backward can be told from one that simply advanced.
+    last_timer_ms: u32,
     initialized: bool,
 }
 
@@ -53,6 +56,7 @@ impl RippleState {
             }; RIPPLE_DROPS],
             drops_tail: 0,
             next_spawn_ms: 0,
+            last_timer_ms: 0,
             initialized: false,
         }
     }
@@ -71,6 +75,16 @@ impl RippleState {
             self.initialized = true;
             self.next_spawn_ms = params.timer_ms;
         }
+
+        // The deadline is a reading of the animation clock, so a clock that
+        // jumped backward leaves it stranded in a future that spawning can
+        // only push further away. Bring it back to now; the droplets in
+        // flight need no such rescue, since their envelope ends them on the
+        // first frame whose elapsed time no longer makes sense.
+        if super::clock_rewound(self.last_timer_ms, params.timer_ms) {
+            self.next_spawn_ms = params.timer_ms;
+        }
+        self.last_timer_ms = params.timer_ms;
 
         // Spawn a new drop if the slot at `drops_tail` is free and the
         // inter-drop timer has elapsed.
@@ -161,5 +175,75 @@ impl RippleState {
         R: Rng,
     {
         self.tick(layout, params, || rng.next_u32() as u8, out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::SliceLayout;
+    use crate::palette::CARNIVAL;
+
+    const POS: &[(u8, u8)] = &[(0, 0), (128, 128), (255, 255)];
+
+    fn params(timer_ms: u32) -> FrameParams<'static> {
+        FrameParams {
+            palette: &CARNIVAL,
+            speed: 128,
+            sat: 255,
+            val: 255,
+            timer_ms,
+        }
+    }
+
+    fn airborne(state: &RippleState) -> usize {
+        state.drops.iter().filter(|d| d.amplitude != 0).count()
+    }
+
+    /// Spawns observed while ticking `state` across `times`. Counting spawns
+    /// rather than lit droplets matters after a clock jump: `elapsed` is
+    /// truncated to 16 bits, so a droplet already in flight can land back
+    /// inside its envelope by chance and keep rendering. Its presence would
+    /// say nothing about whether spawning still works.
+    fn spawns_while_ticking(
+        state: &mut RippleState,
+        layout: &SliceLayout<'_>,
+        times: impl Iterator<Item = u32>,
+    ) -> usize {
+        let mut out = [Hsv::default(); 3];
+        let mut tail = state.drops_tail;
+        let mut spawns = 0;
+        for t in times {
+            state.tick(layout, params(t), || 0, &mut out);
+            if state.drops_tail != tail {
+                spawns += 1;
+                tail = state.drops_tail;
+            }
+        }
+        spawns
+    }
+
+    /// The animation clock can move backward: a split peripheral renders on
+    /// the central's clock, so its time snaps back to the central's uptime
+    /// whenever the central reboots under it. A spawn only pushes the
+    /// deadline forward, so an unrescued jump left ripple spawning nothing
+    /// for as wide as the jump. Same defect as the one Rain carried.
+    #[test]
+    fn spawning_comes_back_after_the_clock_jumps_backward() {
+        let layout = SliceLayout::new(POS);
+        let mut out = [Hsv::default(); 3];
+        let mut state = RippleState::new();
+
+        // An hour of central uptime, replicated to the peripheral.
+        const UPTIME_MS: u32 = 60 * 60 * 1000;
+        state.tick(&layout, params(UPTIME_MS), || 0, &mut out);
+        assert_eq!(airborne(&state), 1, "the first tick should spawn a drop");
+
+        // The central reboots; the shared clock restarts from its uptime.
+        let spawns = spawns_while_ticking(&mut state, &layout, (0..2_000).step_by(40));
+        assert!(
+            spawns > 0,
+            "ripple never spawned again after the clock moved back"
+        );
     }
 }

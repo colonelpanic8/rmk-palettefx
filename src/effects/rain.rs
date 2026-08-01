@@ -243,6 +243,9 @@ fn fall_duration_ms(speed: u8, overshoot: i32, rate: u8) -> u32 {
 pub struct RainState {
     drops: [Drop; RAIN_DROPS],
     next_spawn_ms: u32,
+    /// The animation clock at the previous frame, so a clock that jumps
+    /// backward can be told from one that simply advanced.
+    last_timer_ms: u32,
     initialized: bool,
     params: RainParams,
 }
@@ -269,6 +272,7 @@ impl RainState {
                 active: false,
             }; RAIN_DROPS],
             next_spawn_ms: 0,
+            last_timer_ms: 0,
             initialized: false,
             params,
         }
@@ -299,6 +303,7 @@ impl RainState {
     fn with_single_drop(x: u8, spawn_ms: u32) -> Self {
         let mut state = Self::new();
         state.initialized = true;
+        state.last_timer_ms = spawn_ms;
         state.drops[0] = Drop {
             spawn_ms,
             x,
@@ -348,6 +353,16 @@ impl RainState {
         // be raining. Entering at y=0 just means the trail is clipped until
         // the head has fallen far enough to draw all of it.
         let overshoot = trail_len as i32;
+
+        // Every drop time and the spawn deadline are readings of the animation
+        // clock, so a clock that jumped backward leaves all of them describing
+        // a timeline that no longer exists. Start over: re-priming costs one
+        // frame and refills the board, where keeping the old state would strand
+        // the rain until the clock had climbed all the way back.
+        if self.initialized && super::clock_rewound(self.last_timer_ms, params.timer_ms) {
+            self.initialized = false;
+        }
+        self.last_timer_ms = params.timer_ms;
 
         if !self.initialized {
             self.initialized = true;
@@ -537,6 +552,35 @@ mod tests {
 
     fn lit(frame: &[Hsv]) -> usize {
         frame.iter().filter(|h| h.v != 0).count()
+    }
+
+    /// A Glove80-shaped grid: 20 columns of 6 rows on the 0..=255 grid.
+    fn board_positions() -> [(u8, u8); 80] {
+        let mut positions = [(0u8, 0u8); 80];
+        for (i, p) in positions.iter_mut().enumerate() {
+            let col = (i % 20) as u32;
+            let row = (i / 20) as u32;
+            *p = ((col * 255 / 19) as u8, (row * 255 / 5) as u8);
+        }
+        positions
+    }
+
+    /// A dense, board-filling tuning, as the effect is actually run.
+    fn dense() -> RainParams {
+        RainParams {
+            drops: 28,
+            spawn_interval: 5,
+            trail_len: 161,
+            ..RainParams::DEFAULT
+        }
+    }
+
+    fn walking_entropy() -> impl FnMut() -> u8 {
+        let mut entropy = 7u8;
+        move || {
+            entropy = entropy.wrapping_mul(37).wrapping_add(11);
+            entropy
+        }
     }
 
     #[test]
@@ -737,27 +781,12 @@ mod tests {
     /// it is still off-board above the top row.
     #[test]
     fn dense_rain_holds_a_steady_population_across_the_board() {
-        // A Glove80-shaped grid: 20 columns of 6 rows on the 0..=255 grid.
-        let mut positions = [(0u8, 0u8); 80];
-        for (i, p) in positions.iter_mut().enumerate() {
-            let col = (i % 20) as u32;
-            let row = (i / 20) as u32;
-            *p = ((col * 255 / 19) as u8, (row * 255 / 5) as u8);
-        }
+        let positions = board_positions();
         let layout = SliceLayout::new(&positions);
         let mut out = [Hsv::default(); 80];
 
-        let mut state = RainState::with_params(RainParams {
-            drops: 28,
-            spawn_interval: 5,
-            trail_len: 161,
-            ..RainParams::DEFAULT
-        });
-        let mut entropy = 7u8;
-        let mut rng = move || {
-            entropy = entropy.wrapping_mul(37).wrapping_add(11);
-            entropy
-        };
+        let mut state = RainState::with_params(dense());
+        let mut rng = walking_entropy();
 
         let (mut lowest, mut highest) = (usize::MAX, 0usize);
         for step in 0..200u32 {
@@ -788,6 +817,48 @@ mod tests {
         assert!(
             lowest * 2 > highest,
             "population swung between {lowest} and {highest} lit LEDs"
+        );
+    }
+
+    /// The animation clock is not guaranteed to move forward. A split
+    /// peripheral renders on the central's clock, so its time snaps back to
+    /// the central's uptime every time the central reboots while the
+    /// peripheral keeps running -- reflashing or replugging one half is
+    /// enough. A spawn only ever pushes the deadline forward, so before this
+    /// was handled the rain stopped for as wide as the jump: on the board
+    /// that found it, the right half went hours with no drops at all while
+    /// the key hits Storm blends over the rain carried on working, because
+    /// those are stamped when they happen rather than read off a deadline.
+    #[test]
+    fn rain_comes_back_after_the_clock_jumps_backward() {
+        let positions = board_positions();
+        let layout = SliceLayout::new(&positions);
+        let mut out = [Hsv::default(); 80];
+
+        let mut state = RainState::with_params(dense());
+        let mut rng = walking_entropy();
+
+        // An hour of central uptime, replicated to the peripheral.
+        const UPTIME_MS: u32 = 60 * 60 * 1000;
+        for step in 0..50u32 {
+            state.tick(
+                &layout,
+                params(UPTIME_MS + step * 40, 128),
+                &mut rng,
+                &mut out,
+            );
+        }
+        assert!(lit(&out) > 0, "the board should be raining before the jump");
+
+        // The central reboots; the shared clock restarts from its uptime.
+        let mut peak = 0;
+        for step in 0..50u32 {
+            state.tick(&layout, params(step * 40, 128), &mut rng, &mut out);
+            peak = peak.max(lit(&out));
+        }
+        assert!(
+            peak > 0,
+            "the rain never returned after the clock moved back"
         );
     }
 
