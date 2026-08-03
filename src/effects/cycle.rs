@@ -6,8 +6,9 @@
 //! outgoing effect's state so each effect starts from its own time phase.
 
 use super::{
-    CrosshairParams, CrosshairState, FlowState, FrameParams, KeyfallState, Pcg32, RainParams,
-    RainState, ReactiveState, RippleState, ShockwaveState, SparkleState, TracerState, VortexState,
+    CrosshairParams, CrosshairState, FlowState, FrameParams, KeyfallParams, KeyfallState, Pcg32,
+    RainParams, RainState, ReactiveState, RippleState, ShockwaveState, SparkleState, TracerState,
+    VortexState,
 };
 use crate::color::{Hsv, Rgb, blend_rgb, hsv_to_rgb};
 use crate::layout::LedLayout;
@@ -80,6 +81,11 @@ impl<const HITS: usize> Effect<HITS> {
         index == Self::CROSSHAIR_INDEX
     }
 
+    /// Whether the effect at `index` exposes [`KeyfallParams`].
+    pub const fn uses_keyfall_params(index: u8) -> bool {
+        index == Self::KEYFALL_INDEX
+    }
+
     /// Retune the rain of whichever variant owns a [`RainState`]; a no-op
     /// for every other effect.
     pub const fn set_rain_params(&mut self, params: RainParams) {
@@ -109,6 +115,21 @@ impl<const HITS: usize> Effect<HITS> {
     pub const fn crosshair_params(&self) -> Option<CrosshairParams> {
         match self {
             Self::Crosshair(state) => Some(state.params()),
+            _ => None,
+        }
+    }
+
+    /// Retune Keyfall; a no-op for every other effect.
+    pub const fn set_keyfall_params(&mut self, params: KeyfallParams) {
+        if let Self::Keyfall(state) = self {
+            state.set_params(params);
+        }
+    }
+
+    /// Keyfall tuning, or `None` for every other effect.
+    pub const fn keyfall_params(&self) -> Option<KeyfallParams> {
+        match self {
+            Self::Keyfall(state) => Some(state.params()),
             _ => None,
         }
     }

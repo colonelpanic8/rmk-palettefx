@@ -27,8 +27,11 @@ they have wired up. This crate is MCU, HAL, and driver agnostic.
 - **Tracer** connects consecutive presses with fading lines and bright nodes,
   leaving a short-lived constellation of the typing path. A pause starts a new
   constellation instead of drawing a long unrelated bridge.
-- **Keyfall** launches a narrow palette-colored streak downward from each
-  pressed key.
+- **Keyfall** launches a narrow palette-colored streak from each pressed key
+  toward one board edge. Its single runtime parameter is:
+  - `Gravity`: `0` down, `1` up, `2` left, `3` right. A streak already in
+    flight keeps the direction it launched with, so changing this aims the
+    next press rather than bending the current ones.
 - **Shockwave** launches an expanding palette-colored ring from each pressed
   key.
 

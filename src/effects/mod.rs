@@ -21,7 +21,7 @@ pub use crosshair::{CrosshairMotion, CrosshairParams, CrosshairState};
 pub use cycle::{Effect, EffectStack};
 pub use flow::FlowState;
 pub use gradient::gradient;
-pub use keyfall::KeyfallState;
+pub use keyfall::{KeyfallGravity, KeyfallParams, KeyfallState};
 pub use rain::{RainParams, RainState};
 pub use reactive::{Hit, ReactiveState};
 pub use ripple::{Pcg32, RippleState};

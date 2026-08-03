@@ -27,7 +27,9 @@ use rmk::types::action::LightAction;
 use rmk::lighting::topology::LightingTopology;
 
 use crate::color::{Hsv, Rgb};
-use crate::effects::{CrosshairParams, Effect, EffectStack, FlowState, FrameParams, RainParams};
+use crate::effects::{
+    CrosshairParams, Effect, EffectStack, FlowState, FrameParams, KeyfallParams, RainParams,
+};
 use crate::layout::LedLayout;
 use crate::palette::{BUILTIN_PALETTE_NAMES, BUILTIN_PALETTES};
 
@@ -160,6 +162,8 @@ const EFFECT_COUNT: usize = Effect::<1>::NAMES.len();
 static RAIN_PARAM_SPECS: [ExtensionParamSpec; RainParams::COUNT as usize] = rain_param_specs();
 static CROSSHAIR_PARAM_SPECS: [ExtensionParamSpec; CrosshairParams::COUNT as usize] =
     crosshair_param_specs();
+static KEYFALL_PARAM_SPECS: [ExtensionParamSpec; KeyfallParams::COUNT as usize] =
+    keyfall_param_specs();
 
 const fn rain_param_specs() -> [ExtensionParamSpec; RainParams::COUNT as usize] {
     let mut specs = [ExtensionParamSpec {
@@ -201,6 +205,26 @@ const fn crosshair_param_specs() -> [ExtensionParamSpec; CrosshairParams::COUNT 
     specs
 }
 
+const fn keyfall_param_specs() -> [ExtensionParamSpec; KeyfallParams::COUNT as usize] {
+    let mut specs = [ExtensionParamSpec {
+        name: "",
+        min: 0,
+        max: 0,
+        default: 0,
+    }; KeyfallParams::COUNT as usize];
+    let mut i = 0;
+    while i < specs.len() {
+        specs[i] = ExtensionParamSpec {
+            name: KeyfallParams::NAMES[i],
+            min: KeyfallParams::MINS[i],
+            max: KeyfallParams::MAXES[i],
+            default: KeyfallParams::DEFAULTS[i],
+        };
+        i += 1;
+    }
+    specs
+}
+
 /// Per-effect parameter rows, indexed exactly like `Effect::NAMES`.
 static EFFECT_PARAMS: [&[ExtensionParamSpec]; EFFECT_COUNT] = [
     &[], // Gradient
@@ -214,7 +238,7 @@ static EFFECT_PARAMS: [&[ExtensionParamSpec]; EFFECT_COUNT] = [
     &[], // Reactive
     &CROSSHAIR_PARAM_SPECS, // Crosshair
     &[], // Tracer
-    &[], // Keyfall
+    &KEYFALL_PARAM_SPECS, // Keyfall
     &[], // Shockwave
 ];
 
@@ -260,6 +284,7 @@ pub struct PaletteFxSource<L: LedLayout, const N: usize, const HITS: usize = 16>
     /// an effect and back; rows for effects without parameters are unused.
     rain_params: [RainParams; EFFECT_COUNT],
     crosshair_params: [CrosshairParams; EFFECT_COUNT],
+    keyfall_params: [KeyfallParams; EFFECT_COUNT],
     scratch: [Hsv; N],
     frame: [Rgb; N],
     last_now_ms: u64,
@@ -280,58 +305,54 @@ impl<L: LedLayout, const N: usize, const HITS: usize> PaletteFxSource<L, N, HITS
             config.initial_val
         };
 
-        // Seed the restored tuning into the row for the effect it belongs to.
-        // `RainParams::set` rejects each out-of-range value on its own, so a
+        // Seed each restored record into the row for the effect it belongs to.
+        // The effects' own `set` reject out-of-range values one at a time, so a
         // stale record degrades parameter by parameter rather than wholesale.
         let mut rain_params = [RainParams::DEFAULT; EFFECT_COUNT];
         let mut crosshair_params = [CrosshairParams::DEFAULT; EFFECT_COUNT];
-        if Effect::<HITS>::uses_rain_params(primary_index)
-            && let Some(row) = rain_params.get_mut(primary_index as usize)
-        {
-            let restored = config
-                .initial_params
-                .iter()
-                .take(config.initial_param_len as usize);
-            for (index, &value) in restored.enumerate() {
-                row.set(index as u8, value);
+        let mut keyfall_params = [KeyfallParams::DEFAULT; EFFECT_COUNT];
+        for (slot, values, len) in [
+            (
+                Some(primary_index),
+                &config.initial_params,
+                config.initial_param_len,
+            ),
+            (
+                overlay_index,
+                &config.initial_overlay_params,
+                config.initial_overlay_param_len,
+            ),
+        ] {
+            let Some(index) = slot else { continue };
+            if Effect::<HITS>::uses_rain_params(index) {
+                restore_params(
+                    rain_params.get_mut(index as usize),
+                    values,
+                    len,
+                    |row, i, v| {
+                        row.set(i, v);
+                    },
+                );
             }
-        }
-        if Effect::<HITS>::uses_crosshair_params(primary_index)
-            && let Some(row) = crosshair_params.get_mut(primary_index as usize)
-        {
-            for (index, &value) in config
-                .initial_params
-                .iter()
-                .take(config.initial_param_len as usize)
-                .enumerate()
-            {
-                row.set(index as u8, value);
+            if Effect::<HITS>::uses_crosshair_params(index) {
+                restore_params(
+                    crosshair_params.get_mut(index as usize),
+                    values,
+                    len,
+                    |row, i, v| {
+                        row.set(i, v);
+                    },
+                );
             }
-        }
-        if let Some(index) = overlay_index
-            && Effect::<HITS>::uses_rain_params(index)
-            && let Some(row) = rain_params.get_mut(index as usize)
-        {
-            for (param_index, &value) in config
-                .initial_overlay_params
-                .iter()
-                .take(config.initial_overlay_param_len as usize)
-                .enumerate()
-            {
-                row.set(param_index as u8, value);
-            }
-        }
-        if let Some(index) = overlay_index
-            && Effect::<HITS>::uses_crosshair_params(index)
-            && let Some(row) = crosshair_params.get_mut(index as usize)
-        {
-            for (param_index, &value) in config
-                .initial_overlay_params
-                .iter()
-                .take(config.initial_overlay_param_len as usize)
-                .enumerate()
-            {
-                row.set(param_index as u8, value);
+            if Effect::<HITS>::uses_keyfall_params(index) {
+                restore_params(
+                    keyfall_params.get_mut(index as usize),
+                    values,
+                    len,
+                    |row, i, v| {
+                        row.set(i, v);
+                    },
+                );
             }
         }
 
@@ -350,6 +371,7 @@ impl<L: LedLayout, const N: usize, const HITS: usize> PaletteFxSource<L, N, HITS
             config,
             rain_params,
             crosshair_params,
+            keyfall_params,
             scratch: [Hsv::default(); N],
             frame: [Rgb::default(); N],
             last_now_ms: 0,
@@ -366,9 +388,15 @@ impl<L: LedLayout, const N: usize, const HITS: usize> PaletteFxSource<L, N, HITS
             self.effects.primary_mut(),
             &self.rain_params,
             &self.crosshair_params,
+            &self.keyfall_params,
         );
         if let Some(overlay) = self.effects.overlay_mut() {
-            sync_effect_params(overlay, &self.rain_params, &self.crosshair_params);
+            sync_effect_params(
+                overlay,
+                &self.rain_params,
+                &self.crosshair_params,
+                &self.keyfall_params,
+            );
         }
     }
 
@@ -538,6 +566,8 @@ impl<L: LedLayout, const N: usize, const HITS: usize, Context> LightingSource<Rg
             self.rain_params.get(effect as usize)?.get(index)
         } else if Effect::<HITS>::uses_crosshair_params(effect) {
             self.crosshair_params.get(effect as usize)?.get(index)
+        } else if Effect::<HITS>::uses_keyfall_params(effect) {
+            self.keyfall_params.get(effect as usize)?.get(index)
         } else {
             None
         }
@@ -554,6 +584,10 @@ impl<L: LedLayout, const N: usize, const HITS: usize, Context> LightingSource<Rg
             self.crosshair_params
                 .get_mut(effect as usize)
                 .is_some_and(|params| params.set(index, value))
+        } else if Effect::<HITS>::uses_keyfall_params(effect) {
+            self.keyfall_params
+                .get_mut(effect as usize)
+                .is_some_and(|params| params.set(index, value))
         } else {
             false
         };
@@ -565,6 +599,7 @@ impl<L: LedLayout, const N: usize, const HITS: usize, Context> LightingSource<Rg
                 self.effects.primary_mut(),
                 &self.rain_params,
                 &self.crosshair_params,
+                &self.keyfall_params,
             );
         }
         if self
@@ -576,9 +611,25 @@ impl<L: LedLayout, const N: usize, const HITS: usize, Context> LightingSource<Rg
                 self.effects.overlay_mut().unwrap(),
                 &self.rain_params,
                 &self.crosshair_params,
+                &self.keyfall_params,
             );
         }
         true
+    }
+}
+
+/// Apply a persisted parameter record to the row it belongs to, one bounds
+/// checked value at a time. A missing row (an out-of-range effect index) and a
+/// truncated record both simply leave the defaults in place.
+fn restore_params<P>(
+    row: Option<&mut P>,
+    values: &[u8; MAX_INITIAL_PARAMS],
+    len: u8,
+    mut set: impl FnMut(&mut P, u8, u8),
+) {
+    let Some(row) = row else { return };
+    for (index, &value) in values.iter().take(len as usize).enumerate() {
+        set(row, index as u8, value);
     }
 }
 
@@ -586,6 +637,7 @@ fn sync_effect_params<const HITS: usize>(
     effect: &mut Effect<HITS>,
     rain_params: &[RainParams; EFFECT_COUNT],
     crosshair_params: &[CrosshairParams; EFFECT_COUNT],
+    keyfall_params: &[KeyfallParams; EFFECT_COUNT],
 ) {
     let index = effect.index() as usize;
     if let Some(&params) = rain_params.get(index) {
@@ -593,6 +645,9 @@ fn sync_effect_params<const HITS: usize>(
     }
     if let Some(&params) = crosshair_params.get(index) {
         effect.set_crosshair_params(params);
+    }
+    if let Some(&params) = keyfall_params.get(index) {
+        effect.set_keyfall_params(params);
     }
 }
 
@@ -603,6 +658,7 @@ fn overlay_seed(seed: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::effects::KeyfallGravity;
     use crate::layout::SliceLayout;
 
     static HITS: HitQueue<1> = HitQueue::new();
@@ -681,7 +737,9 @@ mod tests {
             let specs = descriptor.effect_params(effect).unwrap();
             assert_eq!(
                 !specs.is_empty(),
-                Effect::<1>::uses_rain_params(effect) || Effect::<1>::uses_crosshair_params(effect),
+                Effect::<1>::uses_rain_params(effect)
+                    || Effect::<1>::uses_crosshair_params(effect)
+                    || Effect::<1>::uses_keyfall_params(effect),
                 "effect {effect} parameter row disagrees with its state"
             );
         }
@@ -749,6 +807,116 @@ mod tests {
                 Some(spec.default),
             );
         }
+    }
+
+    #[test]
+    fn keyfall_parameters_advertise_and_read_back_their_defaults() {
+        let source = reactive(&NO_HITS);
+        let descriptor =
+            <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::extension_descriptor(&source)
+                .unwrap();
+        let effect = Effect::<1>::KEYFALL_INDEX;
+        let specs = descriptor.effect_params(effect).unwrap();
+        assert_eq!(specs.len(), KeyfallParams::COUNT as usize);
+        for (index, spec) in specs.iter().enumerate() {
+            assert_eq!(spec.name, KeyfallParams::NAMES[index]);
+            assert_eq!(spec.min, KeyfallParams::MINS[index]);
+            assert_eq!(spec.max, KeyfallParams::MAXES[index]);
+            assert_eq!(spec.default, KeyfallParams::DEFAULTS[index]);
+            assert_eq!(
+                <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::extension_param(
+                    &source,
+                    effect,
+                    index as u8,
+                ),
+                Some(spec.default),
+            );
+        }
+    }
+
+    #[test]
+    fn keyfall_gravity_reaches_the_live_effect_and_survives_switching() {
+        let mut source = reactive(&NO_HITS);
+        let keyfall = Effect::<1>::KEYFALL_INDEX;
+        assert!(
+            <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::apply_extension_state(
+                &mut source,
+                ExtensionState {
+                    effect: keyfall,
+                    palette: 0,
+                    value: 255,
+                    speed: 128,
+                },
+            )
+        );
+        assert!(
+            <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::apply_extension_param(
+                &mut source,
+                keyfall,
+                0,
+                KeyfallGravity::Left as u8,
+            )
+        );
+        assert_eq!(
+            source.effects.primary().keyfall_params().unwrap().gravity,
+            KeyfallGravity::Left as u8,
+        );
+
+        for _ in 0..Effect::<1>::NAMES.len() {
+            assert!(
+                <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::handle_light_action(
+                    &mut source,
+                    LightAction::RgbModeForward,
+                )
+            );
+        }
+        assert_eq!(source.effects.primary().index(), keyfall);
+        assert_eq!(
+            source.effects.primary().keyfall_params(),
+            Some(source.keyfall_params[keyfall as usize]),
+        );
+    }
+
+    #[test]
+    fn restored_keyfall_gravity_is_applied_at_boot() {
+        let source: PaletteFxSource<_, 1, 1> = PaletteFxSource::new(
+            SliceLayout::new(&POSITIONS),
+            &NO_HITS,
+            PaletteFxConfig {
+                initial_effect: Effect::<1>::KEYFALL_INDEX,
+                initial_params: [KeyfallGravity::Up as u8, 0, 0, 0, 0, 0, 0, 0],
+                initial_param_len: KeyfallParams::COUNT,
+                ..PaletteFxConfig::default()
+            },
+        );
+        assert_eq!(
+            source.effects.primary().keyfall_params(),
+            Some(KeyfallParams {
+                gravity: KeyfallGravity::Up as u8,
+            }),
+        );
+    }
+
+    /// An overlay carries its own persisted record, so a Keyfall overlay boots
+    /// with the gravity it was saved with.
+    #[test]
+    fn restored_overlay_parameters_are_applied_at_boot() {
+        let source: PaletteFxSource<_, 1, 1> = PaletteFxSource::new(
+            SliceLayout::new(&POSITIONS),
+            &NO_HITS,
+            PaletteFxConfig {
+                initial_overlay: Some(Effect::<1>::KEYFALL_INDEX),
+                initial_overlay_params: [KeyfallGravity::Right as u8, 0, 0, 0, 0, 0, 0, 0],
+                initial_overlay_param_len: KeyfallParams::COUNT,
+                ..PaletteFxConfig::default()
+            },
+        );
+        assert_eq!(
+            source.effects.overlay().and_then(Effect::keyfall_params),
+            Some(KeyfallParams {
+                gravity: KeyfallGravity::Right as u8,
+            }),
+        );
     }
 
     #[test]
@@ -857,6 +1025,7 @@ mod tests {
         let rain = Effect::<1>::RAIN_INDEX;
         let rain_before = source.rain_params;
         let crosshair_before = source.crosshair_params;
+        let keyfall_before = source.keyfall_params;
 
         // Out of range for its spec, an unknown index, and an effect with no
         // parameters at all.
@@ -869,6 +1038,12 @@ mod tests {
                 CrosshairParams::MOTION_MAX + 1,
             ),
             (Effect::<1>::CROSSHAIR_INDEX, CrosshairParams::COUNT, 1),
+            (
+                Effect::<1>::KEYFALL_INDEX,
+                0,
+                KeyfallParams::GRAVITY_MAX + 1,
+            ),
+            (Effect::<1>::KEYFALL_INDEX, KeyfallParams::COUNT, 0),
             (0, 0, 1),
             (Effect::<1>::NAMES.len() as u8, 0, 1),
         ] {
@@ -884,6 +1059,7 @@ mod tests {
         }
         assert_eq!(source.rain_params, rain_before);
         assert_eq!(source.crosshair_params, crosshair_before);
+        assert_eq!(source.keyfall_params, keyfall_before);
         assert_eq!(
             <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::extension_param(&source, 0, 0),
             None,
