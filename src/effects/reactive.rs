@@ -119,6 +119,25 @@ impl<const N: usize> ReactiveState<N> {
             *slot = hsv;
         }
     }
+
+    /// Render Reactive for use as a layer: palette position still follows the
+    /// hit field, while `v` is pure hit coverage. Unlike standalone Reactive,
+    /// an idle layer contributes nothing instead of its dim ambient wash.
+    pub fn tick_layer<L: LedLayout>(
+        &mut self,
+        layout: &L,
+        params: FrameParams<'_>,
+        out: &mut [Hsv],
+    ) {
+        let hit_amplitude = self.amplitudes(params);
+        for (i, slot) in out.iter_mut().enumerate() {
+            let (lx, ly) = layout.position(i);
+            let value = self.value_at(&hit_amplitude, lx, ly);
+            let mut hsv = interp_color(params.palette, value, params.sat, 255);
+            hsv.v = value;
+            *slot = hsv;
+        }
+    }
 }
 
 fn reactive_amplitude(t: u8) -> u8 {

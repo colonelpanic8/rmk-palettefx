@@ -8,7 +8,7 @@
 //! mode/palette/value/speed `LightAction`s ahead of the engine's uniform
 //! background, so `light!(RgbModeForward)`-style keys drive the effects.
 //!
-//! Reactive key hits arrive through a board-owned [`HitQueue`] static: an
+//! Reactive and Crosshair key hits arrive through a board-owned [`HitQueue`] static: an
 //! event task records LED indices and the source timestamps them in its own
 //! animation-clock domain when it drains them on the next frame tick.
 
@@ -18,16 +18,16 @@ use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use heapless::Deque;
 use rmk::lighting::compositor::{
-    Contribution, ExtensionDescriptor, ExtensionParamSpec, ExtensionState, LightingSource,
-    RenderInput,
+    Contribution, ExtensionDescriptor, ExtensionLayerState, ExtensionParamSpec, ExtensionState,
+    LightingSource, RenderInput,
 };
 use rmk::lighting::{EffectSample, LedSlot, Rgb8};
 use rmk::types::action::LightAction;
 
 use rmk::lighting::topology::LightingTopology;
 
-use crate::color::{Hsv, hsv_to_rgb};
-use crate::effects::{Effect, FlowState, FrameParams, RainParams};
+use crate::color::{Hsv, Rgb};
+use crate::effects::{CrosshairParams, Effect, EffectStack, FlowState, FrameParams, RainParams};
 use crate::layout::LedLayout;
 use crate::palette::{BUILTIN_PALETTE_NAMES, BUILTIN_PALETTES};
 
@@ -102,6 +102,12 @@ pub struct PaletteFxConfig {
     /// here, so this is the boot selection whether it came from flash or
     /// from the board's compiled-in choice.
     pub initial_effect: u8,
+    /// Optional second effect rendered over `initial_effect`. It uses the
+    /// same effect-name list, palette, value, speed, and per-effect tuning.
+    pub initial_overlay: Option<u8>,
+    /// Persisted parameter row belonging to `initial_overlay`.
+    pub initial_overlay_params: [u8; MAX_INITIAL_PARAMS],
+    pub initial_overlay_param_len: u8,
     /// Parameter values for `initial_effect`, in advertised index order, as
     /// restored from persistent storage. Only the first `initial_param_len`
     /// entries are read.
@@ -129,6 +135,9 @@ impl Default for PaletteFxConfig {
             initial_palette: 0,
             // An animated default shows the system is alive.
             initial_effect: Effect::<1>::FLOW_INDEX,
+            initial_overlay: None,
+            initial_overlay_params: [0; MAX_INITIAL_PARAMS],
+            initial_overlay_param_len: 0,
             initial_params: [0; MAX_INITIAL_PARAMS],
             initial_param_len: 0,
             frame_interval_ms: 40,
@@ -149,6 +158,8 @@ const EFFECT_COUNT: usize = Effect::<1>::NAMES.len();
 /// own bounds so the advertised defaults cannot drift from
 /// [`RainParams::DEFAULT`].
 static RAIN_PARAM_SPECS: [ExtensionParamSpec; RainParams::COUNT as usize] = rain_param_specs();
+static CROSSHAIR_PARAM_SPECS: [ExtensionParamSpec; CrosshairParams::COUNT as usize] =
+    crosshair_param_specs();
 
 const fn rain_param_specs() -> [ExtensionParamSpec; RainParams::COUNT as usize] {
     let mut specs = [ExtensionParamSpec {
@@ -170,11 +181,27 @@ const fn rain_param_specs() -> [ExtensionParamSpec; RainParams::COUNT as usize] 
     specs
 }
 
-/// Per-effect parameter rows, indexed exactly like `Effect::NAMES`. Rain and
-/// Storm share the rain knobs, but only Storm advertises the hit hue: it is
-/// the one that blends another source over the rain, so on Rain the knob
-/// would do nothing. Trailing entries are hidden by slicing rather than by a
-/// second table, so the two rows cannot drift apart.
+const fn crosshair_param_specs() -> [ExtensionParamSpec; CrosshairParams::COUNT as usize] {
+    let mut specs = [ExtensionParamSpec {
+        name: "",
+        min: 0,
+        max: 0,
+        default: 0,
+    }; CrosshairParams::COUNT as usize];
+    let mut i = 0;
+    while i < specs.len() {
+        specs[i] = ExtensionParamSpec {
+            name: CrosshairParams::NAMES[i],
+            min: CrosshairParams::MINS[i],
+            max: CrosshairParams::MAXES[i],
+            default: CrosshairParams::DEFAULTS[i],
+        };
+        i += 1;
+    }
+    specs
+}
+
+/// Per-effect parameter rows, indexed exactly like `Effect::NAMES`.
 static EFFECT_PARAMS: [&[ExtensionParamSpec]; EFFECT_COUNT] = [
     &[], // Gradient
     &[], // Flow
@@ -185,10 +212,10 @@ static EFFECT_PARAMS: [&[ExtensionParamSpec]; EFFECT_COUNT] = [
         .split_at(RainParams::RAIN_ONLY_COUNT as usize)
         .0, // Rain
     &[], // Reactive
-    &RAIN_PARAM_SPECS, // Storm
+    &CROSSHAIR_PARAM_SPECS, // Crosshair
 ];
 
-/// Pending Reactive key-hit LED indices. `HITS` bounds how many un-drained
+/// Pending key-reactive effect LED indices. `HITS` bounds how many un-drained
 /// presses are remembered between frames.
 pub struct HitQueue<const HITS: usize> {
     hits: BlockingMutex<CriticalSectionRawMutex, RefCell<Deque<u8, HITS>>>,
@@ -220,7 +247,7 @@ pub struct PaletteFxSource<L: LedLayout, const N: usize, const HITS: usize = 16>
     layout: L,
     hits: &'static HitQueue<HITS>,
     config: PaletteFxConfig,
-    effect: Effect<HITS>,
+    effects: EffectStack<HITS>,
     palette_idx: usize,
     val: u8,
     last_nonzero_val: u8,
@@ -229,14 +256,21 @@ pub struct PaletteFxSource<L: LedLayout, const N: usize, const HITS: usize = 16>
     /// rather than in the effect state so tuning survives cycling away from
     /// an effect and back; rows for effects without parameters are unused.
     rain_params: [RainParams; EFFECT_COUNT],
-    frame: [Hsv; N],
+    crosshair_params: [CrosshairParams; EFFECT_COUNT],
+    scratch: [Hsv; N],
+    frame: [Rgb; N],
     last_now_ms: u64,
 }
 
 impl<L: LedLayout, const N: usize, const HITS: usize> PaletteFxSource<L, N, HITS> {
     pub fn new(layout: L, hits: &'static HitQueue<HITS>, config: PaletteFxConfig) -> Self {
-        let effect = Effect::from_index(config.initial_effect, 0)
-            .unwrap_or_else(|| Effect::Flow(FlowState::new()));
+        // Persisted pre-layering Storm records are migrated by the board,
+        // which can distinguish an old record from Crosshair's reused index.
+        let primary_index = config.initial_effect;
+        let overlay_index = config.initial_overlay;
+        let effect =
+            Effect::from_index(primary_index, 0).unwrap_or_else(|| Effect::Flow(FlowState::new()));
+        let overlay = overlay_index.and_then(|index| Effect::from_index(index, overlay_seed(0)));
         let last_nonzero_val = if config.initial_val == 0 {
             config.min_val.max(1)
         } else {
@@ -247,8 +281,9 @@ impl<L: LedLayout, const N: usize, const HITS: usize> PaletteFxSource<L, N, HITS
         // `RainParams::set` rejects each out-of-range value on its own, so a
         // stale record degrades parameter by parameter rather than wholesale.
         let mut rain_params = [RainParams::DEFAULT; EFFECT_COUNT];
-        if Effect::<HITS>::uses_rain_params(config.initial_effect)
-            && let Some(row) = rain_params.get_mut(config.initial_effect as usize)
+        let mut crosshair_params = [CrosshairParams::DEFAULT; EFFECT_COUNT];
+        if Effect::<HITS>::uses_rain_params(primary_index)
+            && let Some(row) = rain_params.get_mut(primary_index as usize)
         {
             let restored = config
                 .initial_params
@@ -258,11 +293,49 @@ impl<L: LedLayout, const N: usize, const HITS: usize> PaletteFxSource<L, N, HITS
                 row.set(index as u8, value);
             }
         }
+        if Effect::<HITS>::uses_crosshair_params(primary_index)
+            && let Some(row) = crosshair_params.get_mut(primary_index as usize)
+        {
+            for (index, &value) in config
+                .initial_params
+                .iter()
+                .take(config.initial_param_len as usize)
+                .enumerate()
+            {
+                row.set(index as u8, value);
+            }
+        }
+        if let Some(index) = overlay_index
+            && Effect::<HITS>::uses_rain_params(index)
+            && let Some(row) = rain_params.get_mut(index as usize)
+        {
+            for (param_index, &value) in config
+                .initial_overlay_params
+                .iter()
+                .take(config.initial_overlay_param_len as usize)
+                .enumerate()
+            {
+                row.set(param_index as u8, value);
+            }
+        }
+        if let Some(index) = overlay_index
+            && Effect::<HITS>::uses_crosshair_params(index)
+            && let Some(row) = crosshair_params.get_mut(index as usize)
+        {
+            for (param_index, &value) in config
+                .initial_overlay_params
+                .iter()
+                .take(config.initial_overlay_param_len as usize)
+                .enumerate()
+            {
+                row.set(param_index as u8, value);
+            }
+        }
 
         let mut source = Self {
             layout,
             hits,
-            effect,
+            effects: EffectStack::new(effect, overlay),
             palette_idx: config.initial_palette,
             val: if config.initial_enabled {
                 config.initial_val
@@ -273,7 +346,9 @@ impl<L: LedLayout, const N: usize, const HITS: usize> PaletteFxSource<L, N, HITS
             speed: config.initial_speed,
             config,
             rain_params,
-            frame: [Hsv::default(); N],
+            crosshair_params,
+            scratch: [Hsv::default(); N],
+            frame: [Rgb::default(); N],
             last_now_ms: 0,
         };
         source.sync_effect_params();
@@ -284,9 +359,13 @@ impl<L: LedLayout, const N: usize, const HITS: usize> PaletteFxSource<L, N, HITS
     /// state. Called after every effect switch, since `Effect::from_index`
     /// and the cycle keys both hand back default-tuned state.
     fn sync_effect_params(&mut self) {
-        let index = self.effect.index() as usize;
-        if let Some(&params) = self.rain_params.get(index) {
-            self.effect.set_rain_params(params);
+        sync_effect_params(
+            self.effects.primary_mut(),
+            &self.rain_params,
+            &self.crosshair_params,
+        );
+        if let Some(overlay) = self.effects.overlay_mut() {
+            sync_effect_params(overlay, &self.rain_params, &self.crosshair_params);
         }
     }
 
@@ -295,11 +374,11 @@ impl<L: LedLayout, const N: usize, const HITS: usize> PaletteFxSource<L, N, HITS
         self.hits.hits.lock(|hits| {
             let mut hits = hits.borrow_mut();
             while let Some(led) = hits.pop_front() {
-                self.effect
+                self.effects
                     .record_hit(&self.layout, led as usize, now_ms as u32);
             }
         });
-        self.effect.tick(
+        self.effects.tick(
             &self.layout,
             FrameParams {
                 palette: BUILTIN_PALETTES[self.palette_idx],
@@ -308,6 +387,7 @@ impl<L: LedLayout, const N: usize, const HITS: usize> PaletteFxSource<L, N, HITS
                 val: self.val,
                 timer_ms: now_ms as u32,
             },
+            &mut self.scratch,
             &mut self.frame,
         );
     }
@@ -336,7 +416,7 @@ impl<L: LedLayout, const N: usize, const HITS: usize, Context> LightingSource<Rg
         if index == 0 {
             self.tick_frame(input.now_ms);
         }
-        let rgb = hsv_to_rgb(self.frame[index]);
+        let rgb = self.frame[index];
         Contribution::Opaque(EffectSample {
             color: Rgb8::new(rgb.r, rgb.g, rgb.b),
             next_change_ms: Some(input.now_ms + self.config.frame_interval_ms),
@@ -355,11 +435,13 @@ impl<L: LedLayout, const N: usize, const HITS: usize, Context> LightingSource<Rg
                 }
             }
             LightAction::RgbModeForward => {
-                self.effect.next(self.ripple_seed());
+                let seed = self.ripple_seed();
+                self.effects.primary_mut().next(seed);
                 self.sync_effect_params();
             }
             LightAction::RgbModeReverse => {
-                self.effect.prev(self.ripple_seed());
+                let seed = self.ripple_seed();
+                self.effects.primary_mut().prev(seed);
                 self.sync_effect_params();
             }
             LightAction::RgbHui => self.palette_idx = (self.palette_idx + 1) % n,
@@ -394,7 +476,7 @@ impl<L: LedLayout, const N: usize, const HITS: usize, Context> LightingSource<Rg
 
     fn extension_state(&self) -> Option<ExtensionState> {
         Some(ExtensionState {
-            effect: self.effect.index(),
+            effect: self.effects.primary().index(),
             palette: self.palette_idx as u8,
             value: self.val,
             speed: self.speed,
@@ -407,11 +489,11 @@ impl<L: LedLayout, const N: usize, const HITS: usize, Context> LightingSource<Rg
         }
         // Switching to the already-active effect keeps its animation state;
         // hosts re-sending the current selection must not reset the phase.
-        if state.effect != self.effect.index() {
+        if state.effect != self.effects.primary().index() {
             let Some(effect) = Effect::from_index(state.effect, self.ripple_seed()) else {
                 return false;
             };
-            self.effect = effect;
+            self.effects.set_primary(effect);
             self.sync_effect_params();
         }
         self.palette_idx = state.palette as usize;
@@ -423,31 +505,96 @@ impl<L: LedLayout, const N: usize, const HITS: usize, Context> LightingSource<Rg
         true
     }
 
-    fn extension_param(&self, effect: u8, index: u8) -> Option<u8> {
-        if !Effect::<HITS>::uses_rain_params(effect) {
-            return None;
+    fn extension_layer_state(&self) -> Option<ExtensionLayerState> {
+        Some(ExtensionLayerState {
+            overlay: self.effects.overlay().map(Effect::index),
+        })
+    }
+
+    fn apply_extension_layer_state(&mut self, state: ExtensionLayerState) -> bool {
+        if state.overlay == self.effects.overlay().map(Effect::index) {
+            return true;
         }
-        self.rain_params.get(effect as usize)?.get(index)
+        let overlay = match state.overlay {
+            Some(index) => {
+                let Some(effect) = Effect::from_index(index, overlay_seed(self.ripple_seed()))
+                else {
+                    return false;
+                };
+                Some(effect)
+            }
+            None => None,
+        };
+        self.effects.set_overlay(overlay);
+        self.sync_effect_params();
+        true
+    }
+
+    fn extension_param(&self, effect: u8, index: u8) -> Option<u8> {
+        if Effect::<HITS>::uses_rain_params(effect) {
+            self.rain_params.get(effect as usize)?.get(index)
+        } else if Effect::<HITS>::uses_crosshair_params(effect) {
+            self.crosshair_params.get(effect as usize)?.get(index)
+        } else {
+            None
+        }
     }
 
     fn apply_extension_param(&mut self, effect: u8, index: u8, value: u8) -> bool {
-        if !Effect::<HITS>::uses_rain_params(effect) {
-            return false;
-        }
-        let Some(params) = self.rain_params.get_mut(effect as usize) else {
-            return false;
-        };
         // `set` is the range authority: it declines out-of-range values
         // without mutating, so a rejected set leaves the source untouched.
-        if !params.set(index, value) {
+        let accepted = if Effect::<HITS>::uses_rain_params(effect) {
+            self.rain_params
+                .get_mut(effect as usize)
+                .is_some_and(|params| params.set(index, value))
+        } else if Effect::<HITS>::uses_crosshair_params(effect) {
+            self.crosshair_params
+                .get_mut(effect as usize)
+                .is_some_and(|params| params.set(index, value))
+        } else {
+            false
+        };
+        if !accepted {
             return false;
         }
-        let params = *params;
-        if effect == self.effect.index() {
-            self.effect.set_rain_params(params);
+        if effect == self.effects.primary().index() {
+            sync_effect_params(
+                self.effects.primary_mut(),
+                &self.rain_params,
+                &self.crosshair_params,
+            );
+        }
+        if self
+            .effects
+            .overlay()
+            .is_some_and(|it| it.index() == effect)
+        {
+            sync_effect_params(
+                self.effects.overlay_mut().unwrap(),
+                &self.rain_params,
+                &self.crosshair_params,
+            );
         }
         true
     }
+}
+
+fn sync_effect_params<const HITS: usize>(
+    effect: &mut Effect<HITS>,
+    rain_params: &[RainParams; EFFECT_COUNT],
+    crosshair_params: &[CrosshairParams; EFFECT_COUNT],
+) {
+    let index = effect.index() as usize;
+    if let Some(&params) = rain_params.get(index) {
+        effect.set_rain_params(params);
+    }
+    if let Some(&params) = crosshair_params.get(index) {
+        effect.set_crosshair_params(params);
+    }
+}
+
+fn overlay_seed(seed: u64) -> u64 {
+    seed ^ 0xD1B5_4A32_D192_ED03
 }
 
 #[cfg(test)]
@@ -468,7 +615,9 @@ mod tests {
                 ..PaletteFxConfig::default()
             },
         );
-        source.effect = Effect::from_index(6, 0).unwrap();
+        source
+            .effects
+            .set_primary(Effect::from_index(6, 0).unwrap());
         source
     }
 
@@ -515,9 +664,9 @@ mod tests {
         );
     }
 
-    /// Every effect that consumes rain tuning must advertise the rain row,
-    /// and no other effect may: otherwise a host offers knobs that do
-    /// nothing, or hides ones that work.
+    /// Every parameterized effect must advertise its row, and no other effect
+    /// may: otherwise a host offers knobs that do nothing, or hides ones that
+    /// work.
     #[test]
     fn advertised_parameter_rows_match_the_effects_that_use_them() {
         let source = reactive(&NO_HITS);
@@ -529,7 +678,7 @@ mod tests {
             let specs = descriptor.effect_params(effect).unwrap();
             assert_eq!(
                 !specs.is_empty(),
-                Effect::<1>::uses_rain_params(effect),
+                Effect::<1>::uses_rain_params(effect) || Effect::<1>::uses_crosshair_params(effect),
                 "effect {effect} parameter row disagrees with its state"
             );
         }
@@ -548,9 +697,6 @@ mod tests {
         let descriptor =
             <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::extension_descriptor(&source)
                 .unwrap();
-        // Storm advertises one more knob than Rain: the hue its key hits take.
-        // Rain blends nothing over itself, so advertising it there would offer
-        // a control that cannot do anything.
         assert_eq!(
             descriptor
                 .effect_params(Effect::<1>::RAIN_INDEX)
@@ -558,11 +704,7 @@ mod tests {
                 .len(),
             RainParams::RAIN_ONLY_COUNT as usize,
         );
-        let storm = descriptor.effect_params(Effect::<1>::STORM_INDEX).unwrap();
-        assert_eq!(storm.len(), RainParams::COUNT as usize);
-        assert_eq!(storm[storm.len() - 1].name, "Hit hue");
-
-        for effect in [Effect::<1>::RAIN_INDEX, Effect::<1>::STORM_INDEX] {
+        for effect in [Effect::<1>::RAIN_INDEX] {
             let specs = descriptor.effect_params(effect).unwrap();
             for (index, spec) in specs.iter().enumerate() {
                 assert_eq!(spec.name, RainParams::NAMES[index]);
@@ -578,6 +720,31 @@ mod tests {
                     Some(spec.default),
                 );
             }
+        }
+    }
+
+    #[test]
+    fn crosshair_parameters_advertise_and_read_back_their_defaults() {
+        let source = reactive(&NO_HITS);
+        let descriptor =
+            <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::extension_descriptor(&source)
+                .unwrap();
+        let effect = Effect::<1>::CROSSHAIR_INDEX;
+        let specs = descriptor.effect_params(effect).unwrap();
+        assert_eq!(specs.len(), CrosshairParams::COUNT as usize);
+        for (index, spec) in specs.iter().enumerate() {
+            assert_eq!(spec.name, CrosshairParams::NAMES[index]);
+            assert_eq!(spec.min, CrosshairParams::MINS[index]);
+            assert_eq!(spec.max, CrosshairParams::MAXES[index]);
+            assert_eq!(spec.default, CrosshairParams::DEFAULTS[index]);
+            assert_eq!(
+                <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::extension_param(
+                    &source,
+                    effect,
+                    index as u8,
+                ),
+                Some(spec.default),
+            );
         }
     }
 
@@ -600,16 +767,6 @@ mod tests {
             ),
             Some(200),
         );
-        // Rain and Storm keep separate values even though they share specs.
-        assert_eq!(
-            <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::extension_param(
-                &source,
-                Effect::<1>::STORM_INDEX,
-                2,
-            ),
-            Some(RainParams::DEFAULT.trail_len),
-        );
-
         // Cycle all the way around: the freshly built Rain state must be
         // retuned from the source's stored values, not left at defaults.
         for _ in 0..Effect::<1>::NAMES.len() {
@@ -638,8 +795,56 @@ mod tests {
             Some(200),
         );
         assert_eq!(
-            source.effect.rain_params(),
+            source.effects.primary().rain_params(),
             Some(source.rain_params[rain as usize])
+        );
+    }
+
+    #[test]
+    fn crosshair_parameter_sets_reach_the_live_effect_and_survive_switching() {
+        let mut source = reactive(&NO_HITS);
+        let crosshair = Effect::<1>::CROSSHAIR_INDEX;
+        assert!(
+            <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::apply_extension_state(
+                &mut source,
+                ExtensionState {
+                    effect: crosshair,
+                    palette: 0,
+                    value: 255,
+                    speed: 128,
+                },
+            )
+        );
+        assert!(
+            <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::apply_extension_param(
+                &mut source,
+                crosshair,
+                4,
+                1,
+            )
+        );
+        assert_eq!(
+            source
+                .effects
+                .primary()
+                .crosshair_params()
+                .unwrap()
+                .active_crosses,
+            1,
+        );
+
+        for _ in 0..Effect::<1>::NAMES.len() {
+            assert!(
+                <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::handle_light_action(
+                    &mut source,
+                    LightAction::RgbModeForward,
+                )
+            );
+        }
+        assert_eq!(source.effects.primary().index(), crosshair);
+        assert_eq!(
+            source.effects.primary().crosshair_params(),
+            Some(source.crosshair_params[crosshair as usize]),
         );
     }
 
@@ -647,13 +852,20 @@ mod tests {
     fn out_of_range_and_unknown_parameters_are_declined_unchanged() {
         let mut source = reactive(&NO_HITS);
         let rain = Effect::<1>::RAIN_INDEX;
-        let before = source.rain_params;
+        let rain_before = source.rain_params;
+        let crosshair_before = source.crosshair_params;
 
         // Out of range for its spec, an unknown index, and an effect with no
         // parameters at all.
         for (effect, index, value) in [
             (rain, 0, RainParams::DROPS_MAX + 1),
             (rain, RainParams::COUNT, 1),
+            (
+                Effect::<1>::CROSSHAIR_INDEX,
+                0,
+                CrosshairParams::MOTION_MAX + 1,
+            ),
+            (Effect::<1>::CROSSHAIR_INDEX, CrosshairParams::COUNT, 1),
             (0, 0, 1),
             (Effect::<1>::NAMES.len() as u8, 0, 1),
         ] {
@@ -667,7 +879,8 @@ mod tests {
                 "effect {effect} index {index} value {value} should be declined"
             );
         }
-        assert_eq!(source.rain_params, before);
+        assert_eq!(source.rain_params, rain_before);
+        assert_eq!(source.crosshair_params, crosshair_before);
         assert_eq!(
             <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::extension_param(&source, 0, 0),
             None,
@@ -685,7 +898,9 @@ mod tests {
                 &NO_HITS,
                 PaletteFxConfig::default(),
             );
-            source.effect = Effect::from_index(Effect::<1>::RAIN_INDEX, 0).unwrap();
+            source
+                .effects
+                .set_primary(Effect::from_index(Effect::<1>::RAIN_INDEX, 0).unwrap());
             source
         };
 
@@ -760,7 +975,8 @@ mod tests {
                 },
             );
             source
-                .effect
+                .effects
+                .primary()
                 .rain_params()
                 .expect("Rain carries rain params")
         };
@@ -781,6 +997,32 @@ mod tests {
         assert_eq!(boot(2, [2, 0, 0, 0, 0, 0, 0, 0]), partial);
     }
 
+    #[test]
+    fn restored_crosshair_parameters_are_applied_at_boot() {
+        let source: PaletteFxSource<_, 1, 1> = PaletteFxSource::new(
+            SliceLayout::new(&POSITIONS),
+            &NO_HITS,
+            PaletteFxConfig {
+                initial_effect: Effect::<1>::CROSSHAIR_INDEX,
+                initial_params: [1, 12, 4, 72, 1, 100, 200, 0],
+                initial_param_len: CrosshairParams::COUNT,
+                ..PaletteFxConfig::default()
+            },
+        );
+        assert_eq!(
+            source.effects.primary().crosshair_params(),
+            Some(CrosshairParams {
+                motion: 1,
+                duration: 12,
+                arm_half_width: 4,
+                pulse_width: 72,
+                active_crosses: 1,
+                arm_hue: 100,
+                key_hue: 200,
+            }),
+        );
+    }
+
     /// Nothing persists the live selection, so `initial_effect` is what the
     /// board shows on every boot. An out-of-range index must still leave an
     /// animated effect running rather than refusing to construct.
@@ -795,14 +1037,58 @@ mod tests {
                     ..PaletteFxConfig::default()
                 },
             );
-            source.effect.index()
+            source.effects.primary().index()
         };
 
-        assert_eq!(boot(Effect::<1>::STORM_INDEX), Effect::<1>::STORM_INDEX);
+        assert_eq!(
+            boot(Effect::<1>::CROSSHAIR_INDEX),
+            Effect::<1>::CROSSHAIR_INDEX
+        );
         assert_eq!(boot(Effect::<1>::RAIN_INDEX), Effect::<1>::RAIN_INDEX);
         assert_eq!(
-            boot(Effect::<1>::NAMES.len() as u8),
+            boot(Effect::<1>::NAMES.len() as u8 + 1),
             Effect::<1>::FLOW_INDEX
         );
+    }
+
+    #[test]
+    fn overlay_uses_the_same_effect_list_and_rejects_unknown_indices() {
+        let mut source: PaletteFxSource<_, 1, 1> = PaletteFxSource::new(
+            SliceLayout::new(&POSITIONS),
+            &NO_HITS,
+            PaletteFxConfig {
+                initial_overlay: Some(2),
+                ..PaletteFxConfig::default()
+            },
+        );
+
+        let layers = |source: &PaletteFxSource<_, 1, 1>| {
+            <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::extension_layer_state(source)
+                .unwrap()
+        };
+        assert_eq!(layers(&source).overlay, Some(2));
+        assert!(
+            <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::apply_extension_layer_state(
+                &mut source,
+                ExtensionLayerState { overlay: Some(4) },
+            )
+        );
+        assert_eq!(layers(&source).overlay, Some(4));
+        assert!(
+            !<PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::apply_extension_layer_state(
+                &mut source,
+                ExtensionLayerState {
+                    overlay: Some(Effect::<1>::NAMES.len() as u8),
+                },
+            )
+        );
+        assert_eq!(layers(&source).overlay, Some(4));
+        assert!(
+            <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::apply_extension_layer_state(
+                &mut source,
+                ExtensionLayerState { overlay: None },
+            )
+        );
+        assert_eq!(layers(&source).overlay, None);
     }
 }

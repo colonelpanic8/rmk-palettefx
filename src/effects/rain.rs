@@ -27,8 +27,7 @@ const RAIN_DROPS: usize = 32;
 /// the drops would fall in lockstep until they aged out.
 const CADENCE_RESYNC_MS: u32 = 2_000;
 
-/// Runtime tuning for the Rain effect (and for the rain background of
-/// Storm). Every field is a `u8` so the whole struct maps directly onto a
+/// Runtime tuning for the Rain effect. Every field is a `u8` so the whole struct maps directly onto a
 /// host-visible parameter list; [`RainParams::DEFAULT`] reproduces the
 /// values a board boots with when it has no persisted selection.
 ///
@@ -57,11 +56,6 @@ pub struct RainParams {
     /// colour instead of sliding along the palette's gradient as a drop fades.
     /// 86 is green, 172 blue.
     pub rain_hue: u8,
-    /// Hue of a blended-in contribution that outshines the rain — Storm's key
-    /// hits. Separate from [`Self::rain_hue`] so a hit reads as a hit rather
-    /// than as unusually bright rain. Plain Rain blends nothing, so this only
-    /// advertises on effects that do.
-    pub hit_hue: u8,
 }
 
 impl RainParams {
@@ -84,8 +78,7 @@ impl RainParams {
     pub const HUE_GREEN: u8 = 86;
     pub const HUE_BLUE: u8 = 172;
 
-    /// Parameters every rain-backed effect advertises. Anything past this is
-    /// specific to an effect that blends another source over the rain.
+    /// Parameters Rain advertises.
     pub const RAIN_ONLY_COUNT: u8 = 5;
 
     /// The tuned defaults. Also the values advertised as each parameter's
@@ -95,26 +88,17 @@ impl RainParams {
         spawn_interval: 30,
         trail_len: 128,
         column_half_width: 14,
-        // Blue rain with green key hits: two hues far enough apart that a hit
-        // is unmistakable against the downpour.
         rain_hue: Self::HUE_BLUE,
-        hit_hue: Self::HUE_GREEN,
     };
 
     /// Number of parameters, i.e. the valid range of the indices accepted by
     /// [`Self::get`] and [`Self::set`].
-    pub const COUNT: u8 = 6;
+    pub const COUNT: u8 = 5;
 
     /// Host-facing parameter names, in index order. `Spawn` carries its
     /// encoding in the name because the value is not milliseconds.
-    pub const NAMES: [&'static str; Self::COUNT as usize] = [
-        "Drops",
-        "Spawn x10ms",
-        "Trail",
-        "Width",
-        "Rain hue",
-        "Hit hue",
-    ];
+    pub const NAMES: [&'static str; Self::COUNT as usize] =
+        ["Drops", "Spawn x10ms", "Trail", "Width", "Rain hue"];
 
     /// Inclusive lower bound of each parameter, in index order.
     pub const MINS: [u8; Self::COUNT as usize] = [
@@ -122,7 +106,6 @@ impl RainParams {
         Self::SPAWN_INTERVAL_MIN,
         Self::TRAIL_LEN_MIN,
         Self::COLUMN_HALF_WIDTH_MIN,
-        Self::HUE_MIN,
         Self::HUE_MIN,
     ];
 
@@ -133,7 +116,6 @@ impl RainParams {
         Self::TRAIL_LEN_MAX,
         Self::COLUMN_HALF_WIDTH_MAX,
         Self::HUE_MAX,
-        Self::HUE_MAX,
     ];
 
     /// Default of each parameter, in index order.
@@ -143,7 +125,6 @@ impl RainParams {
         Self::DEFAULT.trail_len,
         Self::DEFAULT.column_half_width,
         Self::DEFAULT.rain_hue,
-        Self::DEFAULT.hit_hue,
     ];
 
     /// Value of one parameter, or `None` when `index` is out of range.
@@ -154,7 +135,6 @@ impl RainParams {
             2 => self.trail_len,
             3 => self.column_half_width,
             4 => self.rain_hue,
-            5 => self.hit_hue,
             _ => return None,
         })
     }
@@ -173,7 +153,6 @@ impl RainParams {
             2 => self.trail_len = value,
             3 => self.column_half_width = value,
             4 => self.rain_hue = value,
-            5 => self.hit_hue = value,
             _ => return false,
         }
         true
@@ -322,26 +301,7 @@ impl RainState {
         L: LedLayout,
         R: FnMut() -> u8,
     {
-        self.tick_blend(layout, params, rng, out, |_, _, _| 0);
-    }
-
-    /// Like [`Self::tick`], but blends in an extra per-LED intensity from
-    /// `extra(led_index, lx, ly)`: the final palette lookup uses the max of
-    /// the rain intensity and the extra intensity. Lets another effect (e.g.
-    /// Reactive's key-hit bumps) render over the rain background while
-    /// keeping unlit LEDs black.
-    pub fn tick_blend<L, R, F>(
-        &mut self,
-        layout: &L,
-        params: FrameParams<'_>,
-        mut rng: R,
-        out: &mut [Hsv],
-        mut extra: F,
-    ) where
-        L: LedLayout,
-        R: FnMut() -> u8,
-        F: FnMut(usize, u8, u8) -> u8,
-    {
+        let mut rng = rng;
         let count = layout.count();
         let active_drops = self.params.active_drops();
         let trail_len = self.params.trail_len.max(1) as u16;
@@ -487,17 +447,6 @@ impl RainState {
                 intensity = intensity.max(scale8(along, across));
             }
 
-            // Whichever contribution is brighter owns the pixel. Colouring
-            // after that choice, rather than sampling one palette position for
-            // the combined intensity, is what lets a key hit read as its own
-            // colour instead of as unusually bright rain.
-            let hit = extra(i, lx, ly);
-            let (value, hue) = if hit > intensity {
-                (hit, self.params.hit_hue)
-            } else {
-                (intensity, self.params.rain_hue)
-            };
-
             // Brightness follows intensity, so the background stays black and
             // a trail dims toward its tail. Hue and saturation are the
             // effect's own rather than the palette's: palettes desaturate
@@ -505,9 +454,9 @@ impl RainState {
             // that matter -- drop heads and key hits -- white, hiding the
             // chosen hues.
             *slot = Hsv {
-                h: hue,
+                h: self.params.rain_hue,
                 s: params.sat,
-                v: scale8(value, params.val),
+                v: scale8(intensity, params.val),
             };
         }
     }
@@ -649,8 +598,7 @@ mod tests {
                 params.spawn_interval,
                 params.trail_len,
                 params.column_half_width,
-                params.rain_hue,
-                params.hit_hue
+                params.rain_hue
             ]
         );
     }
@@ -742,32 +690,6 @@ mod tests {
         }
     }
 
-    /// A key hit has to be legible as a hit, not as unusually bright rain, so
-    /// the brighter contribution picks the colour and a hit rotates its hue.
-    #[test]
-    fn a_blended_hit_takes_its_own_hue() {
-        const POS: &[(u8, u8)] = &[(0, 0)];
-        let layout = SliceLayout::new(POS);
-        let mut out = [Hsv::default(); 1];
-
-        let mut state = RainState::with_params(RainParams::DEFAULT);
-        // No drop reaches this LED, so the hit is the only contribution.
-        state.tick_blend(&layout, params(0, 128), || 200, &mut out, |_, _, _| 255);
-        let hit = out[0];
-        assert_eq!(hit.h, RainParams::HUE_GREEN);
-
-        // The same LED with no hit takes the rain's hue instead. Walk time
-        // until the falling head actually reaches it.
-        let mut rain = RainState::with_single_drop(0, 0);
-        let lit = (0..6000).step_by(100).find_map(|t| {
-            rain.tick(&layout, params(t, 128), || 0, &mut out);
-            (out[0].v > 0).then_some(out[0])
-        });
-        let lit = lit.expect("the drop should light this LED as it falls past");
-        assert_eq!(lit.h, RainParams::HUE_BLUE);
-        assert_ne!(hit.h, lit.h);
-    }
-
     /// Rain has to arrive steadily, not in waves. Measured across a whole
     /// board at the dense setting, because the failure is a population that
     /// collapses and refills rather than anything visible on one LED.
@@ -827,8 +749,8 @@ mod tests {
     /// enough. A spawn only ever pushes the deadline forward, so before this
     /// was handled the rain stopped for as wide as the jump: on the board
     /// that found it, the right half went hours with no drops at all while
-    /// the key hits Storm blends over the rain carried on working, because
-    /// those are stamped when they happen rather than read off a deadline.
+    /// reactive key hits carried on working, because those are stamped when
+    /// they happen rather than read off a deadline.
     #[test]
     fn rain_comes_back_after_the_clock_jumps_backward() {
         let positions = board_positions();

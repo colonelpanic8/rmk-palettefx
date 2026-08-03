@@ -6,12 +6,11 @@
 //! outgoing effect's state so each effect starts from its own time phase.
 
 use super::{
-    FlowState, FrameParams, Pcg32, RainParams, RainState, ReactiveState, RippleState, SparkleState,
-    VortexState,
+    CrosshairParams, CrosshairState, FlowState, FrameParams, Pcg32, RainParams, RainState,
+    ReactiveState, RippleState, SparkleState, VortexState,
 };
-use crate::color::Hsv;
+use crate::color::{Hsv, Rgb, blend_rgb, hsv_to_rgb};
 use crate::layout::LedLayout;
-use rand_core::Rng;
 
 /// Stream selector for the Ripple RNG; any odd constant works, this one is
 /// from the PCG reference implementation.
@@ -21,8 +20,8 @@ const RIPPLE_RNG_STREAM: u64 = 0xA02B_DBF7_BB3C_0A7F;
 /// effects don't share drop-placement sequences when seeded alike.
 const RAIN_RNG_STREAM: u64 = 0x5851_F42D_4C95_7F2D;
 
-/// The currently active effect and its state. `HITS` sizes the Reactive
-/// effect's ring of remembered key presses.
+/// The currently active effect and its state. `HITS` sizes the Reactive and
+/// Crosshair rings of remembered key presses.
 pub enum Effect<const HITS: usize> {
     Gradient,
     Flow(FlowState),
@@ -31,37 +30,49 @@ pub enum Effect<const HITS: usize> {
     Ripple(RippleState, Pcg32),
     Rain(RainState, Pcg32),
     Reactive(ReactiveState<HITS>),
-    /// Rain as the ambient background with Reactive's key-hit bumps
-    /// blended over it.
-    Storm(RainState, Pcg32, ReactiveState<HITS>),
+    Crosshair(CrosshairState<HITS>),
 }
 
 impl<const HITS: usize> Effect<HITS> {
     /// Display names in stable index order; `index`/`from_index` and the
     /// next/prev cycle all agree with this ordering.
     pub const NAMES: [&'static str; 8] = [
-        "Gradient", "Flow", "Vortex", "Sparkle", "Ripple", "Rain", "Reactive", "Storm",
+        "Gradient",
+        "Flow",
+        "Vortex",
+        "Sparkle",
+        "Ripple",
+        "Rain",
+        "Reactive",
+        "Crosshair",
     ];
 
     /// Stable index of the Flow effect into [`Self::NAMES`].
     pub const FLOW_INDEX: u8 = 1;
     /// Stable index of the Rain effect into [`Self::NAMES`].
     pub const RAIN_INDEX: u8 = 5;
-    /// Stable index of the Storm effect into [`Self::NAMES`].
-    pub const STORM_INDEX: u8 = 7;
+    /// The retired Storm index. It is now occupied by Crosshair, so callers
+    /// restoring pre-layering records must migrate Storm before construction.
+    pub const LEGACY_STORM_INDEX: u8 = 7;
+    /// Stable index of the Crosshair effect into [`Self::NAMES`].
+    pub const CROSSHAIR_INDEX: u8 = 7;
 
     /// Whether the effect at `index` renders a [`RainState`], and therefore
-    /// exposes the [`RainParams`] tuning. Rain and Storm both do; Storm's
-    /// background *is* the rain, so it takes the same knobs.
+    /// exposes the [`RainParams`] tuning.
     pub const fn uses_rain_params(index: u8) -> bool {
-        matches!(index, Self::RAIN_INDEX | Self::STORM_INDEX)
+        index == Self::RAIN_INDEX
+    }
+
+    /// Whether the effect at `index` exposes [`CrosshairParams`].
+    pub const fn uses_crosshair_params(index: u8) -> bool {
+        index == Self::CROSSHAIR_INDEX
     }
 
     /// Retune the rain of whichever variant owns a [`RainState`]; a no-op
     /// for every other effect.
     pub const fn set_rain_params(&mut self, params: RainParams) {
         match self {
-            Self::Rain(rain, _) | Self::Storm(rain, _, _) => rain.set_params(params),
+            Self::Rain(rain, _) => rain.set_params(params),
             _ => {}
         }
     }
@@ -70,7 +81,22 @@ impl<const HITS: usize> Effect<HITS> {
     /// for effects that have none.
     pub const fn rain_params(&self) -> Option<RainParams> {
         match self {
-            Self::Rain(rain, _) | Self::Storm(rain, _, _) => Some(rain.params()),
+            Self::Rain(rain, _) => Some(rain.params()),
+            _ => None,
+        }
+    }
+
+    /// Retune Crosshair; a no-op for every other effect.
+    pub const fn set_crosshair_params(&mut self, params: CrosshairParams) {
+        if let Self::Crosshair(state) = self {
+            state.set_params(params);
+        }
+    }
+
+    /// Crosshair tuning, or `None` for every other effect.
+    pub const fn crosshair_params(&self) -> Option<CrosshairParams> {
+        match self {
+            Self::Crosshair(state) => Some(state.params()),
             _ => None,
         }
     }
@@ -85,7 +111,7 @@ impl<const HITS: usize> Effect<HITS> {
             Self::Ripple(_, _) => 4,
             Self::Rain(_, _) => 5,
             Self::Reactive(_) => 6,
-            Self::Storm(_, _, _) => 7,
+            Self::Crosshair(_) => 7,
         }
     }
 
@@ -100,11 +126,7 @@ impl<const HITS: usize> Effect<HITS> {
             4 => Self::Ripple(RippleState::new(), ripple_rng(ripple_seed)),
             5 => Self::Rain(RainState::new(), rain_rng(ripple_seed)),
             6 => Self::Reactive(ReactiveState::new()),
-            7 => Self::Storm(
-                RainState::new(),
-                rain_rng(ripple_seed),
-                ReactiveState::new(),
-            ),
+            7 => Self::Crosshair(CrosshairState::new()),
             _ => return None,
         })
     }
@@ -119,17 +141,23 @@ impl<const HITS: usize> Effect<HITS> {
             Self::Ripple(s, rng) => s.tick_with_rng(rng, layout, params, out),
             Self::Rain(s, rng) => s.tick_with_rng(rng, layout, params, out),
             Self::Reactive(s) => s.tick(layout, params, out),
-            Self::Storm(rain, rng, reactive) => {
-                let amps = reactive.amplitudes(params);
-                let reactive = &*reactive;
-                rain.tick_blend(
-                    layout,
-                    params,
-                    || rng.next_u32() as u8,
-                    out,
-                    |_, lx, ly| reactive.value_at(&amps, lx, ly),
-                );
-            }
+            Self::Crosshair(s) => s.tick(layout, params, out),
+        }
+    }
+
+    /// Render the effect as a layer whose output value represents coverage.
+    /// Most effects already spend value that way. Reactive's standalone dim
+    /// wash is deliberately removed so only key hits cover the lower slot.
+    pub fn tick_layer<L: LedLayout>(
+        &mut self,
+        layout: &L,
+        params: FrameParams<'_>,
+        out: &mut [Hsv],
+    ) {
+        match self {
+            Self::Reactive(state) => state.tick_layer(layout, params, out),
+            Self::Crosshair(state) => state.tick_layer(layout, params, out),
+            _ => self.tick(layout, params, out),
         }
     }
 
@@ -144,24 +172,16 @@ impl<const HITS: usize> Effect<HITS> {
             Self::Sparkle(_) => Self::Ripple(RippleState::new(), ripple_rng(ripple_seed)),
             Self::Ripple(_, _) => Self::Rain(RainState::new(), rain_rng(ripple_seed)),
             Self::Rain(_, _) => Self::Reactive(ReactiveState::new()),
-            Self::Reactive(_) => Self::Storm(
-                RainState::new(),
-                rain_rng(ripple_seed),
-                ReactiveState::new(),
-            ),
-            Self::Storm(_, _, _) => Self::Gradient,
+            Self::Reactive(_) => Self::Crosshair(CrosshairState::new()),
+            Self::Crosshair(_) => Self::Gradient,
         };
     }
 
     /// Switch to the previous effect in the cycle; see [`Effect::next`].
     pub fn prev(&mut self, ripple_seed: u64) {
         *self = match self {
-            Self::Gradient => Self::Storm(
-                RainState::new(),
-                rain_rng(ripple_seed),
-                ReactiveState::new(),
-            ),
-            Self::Storm(_, _, _) => Self::Reactive(ReactiveState::new()),
+            Self::Gradient => Self::Crosshair(CrosshairState::new()),
+            Self::Crosshair(_) => Self::Reactive(ReactiveState::new()),
             Self::Reactive(_) => Self::Rain(RainState::new(), rain_rng(ripple_seed)),
             Self::Rain(_, _) => Self::Ripple(RippleState::new(), ripple_rng(ripple_seed)),
             Self::Ripple(_, _) => Self::Sparkle(SparkleState::new()),
@@ -171,18 +191,97 @@ impl<const HITS: usize> Effect<HITS> {
         };
     }
 
-    /// Record a key press at `led_idx` against the Reactive effect; no-op
-    /// for every other variant. Returns `true` iff a hit was recorded, so
-    /// the caller can skip a re-render that would not be visible.
+    /// Record a key press at `led_idx` against a key-reactive effect; no-op
+    /// for every other variant. Returns `true` iff a hit was recorded, so the
+    /// caller can skip a re-render that would not be visible.
     pub fn record_hit<L: LedLayout>(&mut self, layout: &L, led_idx: usize, timer_ms: u32) -> bool {
-        let s = match self {
-            Self::Reactive(s) => s,
-            Self::Storm(_, _, s) => s,
-            _ => return false,
-        };
         let (x, y) = layout.position(led_idx);
-        s.record_hit(x, y, timer_ms);
+        match self {
+            Self::Reactive(state) => state.record_hit(x, y, timer_ms),
+            Self::Crosshair(state) => state.record_hit(led_idx, x, y, timer_ms),
+            _ => return false,
+        }
         true
+    }
+}
+
+/// A two-slot stack whose slots both accept the same effect set.
+///
+/// The primary is always present and is what mode-forward/reverse cycles.
+/// The overlay is independently selectable and may contain any effect,
+/// including another instance of the primary effect.
+pub struct EffectStack<const HITS: usize> {
+    primary: Effect<HITS>,
+    overlay: Option<Effect<HITS>>,
+}
+
+impl<const HITS: usize> EffectStack<HITS> {
+    pub const fn new(primary: Effect<HITS>, overlay: Option<Effect<HITS>>) -> Self {
+        Self { primary, overlay }
+    }
+
+    pub const fn primary(&self) -> &Effect<HITS> {
+        &self.primary
+    }
+
+    pub const fn primary_mut(&mut self) -> &mut Effect<HITS> {
+        &mut self.primary
+    }
+
+    pub const fn overlay(&self) -> Option<&Effect<HITS>> {
+        self.overlay.as_ref()
+    }
+
+    pub const fn overlay_mut(&mut self) -> Option<&mut Effect<HITS>> {
+        self.overlay.as_mut()
+    }
+
+    pub fn set_primary(&mut self, effect: Effect<HITS>) {
+        self.primary = effect;
+    }
+
+    pub fn set_overlay(&mut self, effect: Option<Effect<HITS>>) {
+        self.overlay = effect;
+    }
+
+    /// Render both slots. The overlay's rendered value is its coverage; its
+    /// hue/saturation are composited at the stack's global brightness. This
+    /// keeps sparse effects sparse without applying brightness twice.
+    pub fn tick<L: LedLayout>(
+        &mut self,
+        layout: &L,
+        params: FrameParams<'_>,
+        scratch: &mut [Hsv],
+        out: &mut [Rgb],
+    ) {
+        self.primary.tick(layout, params, scratch);
+        for (target, &pixel) in out.iter_mut().zip(scratch.iter()) {
+            *target = hsv_to_rgb(pixel);
+        }
+
+        let Some(overlay) = self.overlay.as_mut() else {
+            return;
+        };
+        let overlay_params = FrameParams { val: 255, ..params };
+        overlay.tick_layer(layout, overlay_params, scratch);
+        for (target, &pixel) in out.iter_mut().zip(scratch.iter()) {
+            let coverage = pixel.v;
+            let color = hsv_to_rgb(Hsv {
+                v: params.val,
+                ..pixel
+            });
+            *target = blend_rgb(*target, color, coverage);
+        }
+    }
+
+    /// Record a press in every key-reactive instance in the stack.
+    pub fn record_hit<L: LedLayout>(&mut self, layout: &L, led_idx: usize, timer_ms: u32) -> bool {
+        let primary = self.primary.record_hit(layout, led_idx, timer_ms);
+        let overlay = self
+            .overlay
+            .as_mut()
+            .is_some_and(|effect| effect.record_hit(layout, led_idx, timer_ms));
+        primary || overlay
     }
 }
 
@@ -210,28 +309,57 @@ mod tests {
         }
     }
 
-    /// In Storm, a key hit lights its LED even when no rain drop is in
-    /// that column, and without hits the same LED stays dark (rain keeps
-    /// its black background rather than Reactive's dim ambient one).
+    /// Reactive can occupy the overlay slot above Rain and light a key whose
+    /// rain background is dark.
     #[test]
-    fn storm_blends_key_hits_over_dark_rain_background() {
-        // x=200: the Storm RNG under this seed never places a drop close
+    fn reactive_blends_over_dark_rain_background() {
+        // x=200: the Rain RNG under this seed never places a drop close
         // enough to this column during the frames we sample.
         const LEDS: &[(u8, u8)] = &[(200, 128)];
         let layout = SliceLayout::new(LEDS);
-        let mut out = [Hsv::default(); 1];
+        let mut scratch = [Hsv::default(); 1];
+        let mut quiet_out = [Rgb::default(); 1];
+        let mut hit_out = [Rgb::default(); 1];
 
-        let mut quiet: Effect<8> = Effect::from_index(7, 1).expect("Storm index");
-        let mut hit: Effect<8> = Effect::from_index(7, 1).expect("Storm index");
+        let build = || -> EffectStack<8> {
+            EffectStack::new(
+                Effect::<8>::from_index(Effect::<8>::RAIN_INDEX, 1).unwrap(),
+                Some(Effect::<8>::from_index(6, 2).unwrap()),
+            )
+        };
+        let mut quiet = build();
+        let mut hit = build();
         assert!(hit.record_hit(&layout, 0, 0));
 
         let mut hit_lit = false;
         for t in (0..2000).step_by(50) {
-            quiet.tick(&layout, params(t), &mut out);
-            assert_eq!(out[0].v, 0, "no drop and no hit at t={t} must be black");
-            hit.tick(&layout, params(t), &mut out);
-            hit_lit |= out[0].v != 0;
+            quiet.tick(&layout, params(t), &mut scratch, &mut quiet_out);
+            assert_eq!(
+                quiet_out[0],
+                Rgb::default(),
+                "idle overlay at t={t} must stay transparent"
+            );
+            hit.tick(&layout, params(t), &mut scratch, &mut hit_out);
+            hit_lit |= hit_out[0] != quiet_out[0];
         }
-        assert!(hit_lit, "key hit never lit its LED");
+        assert!(hit_lit, "key hit never changed its LED");
+    }
+
+    #[test]
+    fn any_effect_can_fill_either_slot() {
+        const LEDS: &[(u8, u8)] = &[(128, 128)];
+        let layout = SliceLayout::new(LEDS);
+        let mut scratch = [Hsv::default(); 1];
+        let mut out = [Rgb::default(); 1];
+
+        for primary in 0..Effect::<1>::NAMES.len() as u8 {
+            for overlay in 0..Effect::<1>::NAMES.len() as u8 {
+                let mut stack: EffectStack<1> = EffectStack::new(
+                    Effect::<1>::from_index(primary, 1).unwrap(),
+                    Some(Effect::<1>::from_index(overlay, 2).unwrap()),
+                );
+                stack.tick(&layout, params(100), &mut scratch, &mut out);
+            }
+        }
     }
 }

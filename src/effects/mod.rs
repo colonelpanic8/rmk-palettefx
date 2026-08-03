@@ -4,6 +4,7 @@
 
 use crate::palette::Palette;
 
+mod crosshair;
 mod cycle;
 mod flow;
 mod gradient;
@@ -13,7 +14,8 @@ mod ripple;
 mod sparkle;
 mod vortex;
 
-pub use cycle::Effect;
+pub use crosshair::{CrosshairMotion, CrosshairParams, CrosshairState};
+pub use cycle::{Effect, EffectStack};
 pub use flow::FlowState;
 pub use gradient::gradient;
 pub use rain::{RainParams, RainState};
