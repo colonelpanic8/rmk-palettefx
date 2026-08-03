@@ -18,6 +18,22 @@ they have wired up. This crate is MCU, HAL, and driver agnostic.
 - Rain
 - Reactive
 - Crosshair
+- Tracer
+- Keyfall
+- Shockwave
+
+### Typing-reactive effects
+
+- **Tracer** connects consecutive presses with fading lines and bright nodes,
+  leaving a short-lived constellation of the typing path. A pause starts a new
+  constellation instead of drawing a long unrelated bridge.
+- **Keyfall** launches a narrow palette-colored streak downward from each
+  pressed key.
+- **Shockwave** launches an expanding palette-colored ring from each pressed
+  key.
+
+All three are sparse and can be selected either as the primary effect or as an
+overlay. They use the shared palette, speed, and brightness controls.
 
 ### Crosshair
 

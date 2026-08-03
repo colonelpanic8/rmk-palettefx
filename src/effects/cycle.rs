@@ -6,8 +6,8 @@
 //! outgoing effect's state so each effect starts from its own time phase.
 
 use super::{
-    CrosshairParams, CrosshairState, FlowState, FrameParams, Pcg32, RainParams, RainState,
-    ReactiveState, RippleState, SparkleState, VortexState,
+    CrosshairParams, CrosshairState, FlowState, FrameParams, KeyfallState, Pcg32, RainParams,
+    RainState, ReactiveState, RippleState, ShockwaveState, SparkleState, TracerState, VortexState,
 };
 use crate::color::{Hsv, Rgb, blend_rgb, hsv_to_rgb};
 use crate::layout::LedLayout;
@@ -20,8 +20,8 @@ const RIPPLE_RNG_STREAM: u64 = 0xA02B_DBF7_BB3C_0A7F;
 /// effects don't share drop-placement sequences when seeded alike.
 const RAIN_RNG_STREAM: u64 = 0x5851_F42D_4C95_7F2D;
 
-/// The currently active effect and its state. `HITS` sizes the Reactive and
-/// Crosshair rings of remembered key presses.
+/// The currently active effect and its state. `HITS` sizes every key-reactive
+/// effect's ring of remembered key presses.
 pub enum Effect<const HITS: usize> {
     Gradient,
     Flow(FlowState),
@@ -31,12 +31,15 @@ pub enum Effect<const HITS: usize> {
     Rain(RainState, Pcg32),
     Reactive(ReactiveState<HITS>),
     Crosshair(CrosshairState<HITS>),
+    Tracer(TracerState<HITS>),
+    Keyfall(KeyfallState<HITS>),
+    Shockwave(ShockwaveState<HITS>),
 }
 
 impl<const HITS: usize> Effect<HITS> {
     /// Display names in stable index order; `index`/`from_index` and the
     /// next/prev cycle all agree with this ordering.
-    pub const NAMES: [&'static str; 8] = [
+    pub const NAMES: [&'static str; 11] = [
         "Gradient",
         "Flow",
         "Vortex",
@@ -45,6 +48,9 @@ impl<const HITS: usize> Effect<HITS> {
         "Rain",
         "Reactive",
         "Crosshair",
+        "Tracer",
+        "Keyfall",
+        "Shockwave",
     ];
 
     /// Stable index of the Flow effect into [`Self::NAMES`].
@@ -56,6 +62,12 @@ impl<const HITS: usize> Effect<HITS> {
     pub const LEGACY_STORM_INDEX: u8 = 7;
     /// Stable index of the Crosshair effect into [`Self::NAMES`].
     pub const CROSSHAIR_INDEX: u8 = 7;
+    /// Stable index of the Tracer effect into [`Self::NAMES`].
+    pub const TRACER_INDEX: u8 = 8;
+    /// Stable index of the Keyfall effect into [`Self::NAMES`].
+    pub const KEYFALL_INDEX: u8 = 9;
+    /// Stable index of the Shockwave effect into [`Self::NAMES`].
+    pub const SHOCKWAVE_INDEX: u8 = 10;
 
     /// Whether the effect at `index` renders a [`RainState`], and therefore
     /// exposes the [`RainParams`] tuning.
@@ -112,6 +124,9 @@ impl<const HITS: usize> Effect<HITS> {
             Self::Rain(_, _) => 5,
             Self::Reactive(_) => 6,
             Self::Crosshair(_) => 7,
+            Self::Tracer(_) => 8,
+            Self::Keyfall(_) => 9,
+            Self::Shockwave(_) => 10,
         }
     }
 
@@ -127,6 +142,9 @@ impl<const HITS: usize> Effect<HITS> {
             5 => Self::Rain(RainState::new(), rain_rng(ripple_seed)),
             6 => Self::Reactive(ReactiveState::new()),
             7 => Self::Crosshair(CrosshairState::new()),
+            8 => Self::Tracer(TracerState::new()),
+            9 => Self::Keyfall(KeyfallState::new()),
+            10 => Self::Shockwave(ShockwaveState::new()),
             _ => return None,
         })
     }
@@ -142,6 +160,9 @@ impl<const HITS: usize> Effect<HITS> {
             Self::Rain(s, rng) => s.tick_with_rng(rng, layout, params, out),
             Self::Reactive(s) => s.tick(layout, params, out),
             Self::Crosshair(s) => s.tick(layout, params, out),
+            Self::Tracer(s) => s.tick(layout, params, out),
+            Self::Keyfall(s) => s.tick(layout, params, out),
+            Self::Shockwave(s) => s.tick(layout, params, out),
         }
     }
 
@@ -157,6 +178,9 @@ impl<const HITS: usize> Effect<HITS> {
         match self {
             Self::Reactive(state) => state.tick_layer(layout, params, out),
             Self::Crosshair(state) => state.tick_layer(layout, params, out),
+            Self::Tracer(state) => state.tick_layer(layout, params, out),
+            Self::Keyfall(state) => state.tick_layer(layout, params, out),
+            Self::Shockwave(state) => state.tick_layer(layout, params, out),
             _ => self.tick(layout, params, out),
         }
     }
@@ -173,14 +197,20 @@ impl<const HITS: usize> Effect<HITS> {
             Self::Ripple(_, _) => Self::Rain(RainState::new(), rain_rng(ripple_seed)),
             Self::Rain(_, _) => Self::Reactive(ReactiveState::new()),
             Self::Reactive(_) => Self::Crosshair(CrosshairState::new()),
-            Self::Crosshair(_) => Self::Gradient,
+            Self::Crosshair(_) => Self::Tracer(TracerState::new()),
+            Self::Tracer(_) => Self::Keyfall(KeyfallState::new()),
+            Self::Keyfall(_) => Self::Shockwave(ShockwaveState::new()),
+            Self::Shockwave(_) => Self::Gradient,
         };
     }
 
     /// Switch to the previous effect in the cycle; see [`Effect::next`].
     pub fn prev(&mut self, ripple_seed: u64) {
         *self = match self {
-            Self::Gradient => Self::Crosshair(CrosshairState::new()),
+            Self::Gradient => Self::Shockwave(ShockwaveState::new()),
+            Self::Shockwave(_) => Self::Keyfall(KeyfallState::new()),
+            Self::Keyfall(_) => Self::Tracer(TracerState::new()),
+            Self::Tracer(_) => Self::Crosshair(CrosshairState::new()),
             Self::Crosshair(_) => Self::Reactive(ReactiveState::new()),
             Self::Reactive(_) => Self::Rain(RainState::new(), rain_rng(ripple_seed)),
             Self::Rain(_, _) => Self::Ripple(RippleState::new(), ripple_rng(ripple_seed)),
@@ -199,6 +229,9 @@ impl<const HITS: usize> Effect<HITS> {
         match self {
             Self::Reactive(state) => state.record_hit(x, y, timer_ms),
             Self::Crosshair(state) => state.record_hit(led_idx, x, y, timer_ms),
+            Self::Tracer(state) => state.record_hit(x, y, timer_ms),
+            Self::Keyfall(state) => state.record_hit(layout, x, y, timer_ms),
+            Self::Shockwave(state) => state.record_hit(layout, x, y, timer_ms),
             _ => return false,
         }
         true
@@ -306,6 +339,48 @@ mod tests {
             sat: 255,
             val: 255,
             timer_ms,
+        }
+    }
+
+    #[test]
+    fn new_effects_append_without_renumbering_existing_effects() {
+        assert_eq!(
+            Effect::<1>::NAMES[Effect::<1>::CROSSHAIR_INDEX as usize],
+            "Crosshair"
+        );
+        assert_eq!(
+            Effect::<1>::NAMES[Effect::<1>::TRACER_INDEX as usize],
+            "Tracer"
+        );
+        assert_eq!(
+            Effect::<1>::NAMES[Effect::<1>::KEYFALL_INDEX as usize],
+            "Keyfall"
+        );
+        assert_eq!(
+            Effect::<1>::NAMES[Effect::<1>::SHOCKWAVE_INDEX as usize],
+            "Shockwave"
+        );
+        for index in 0..Effect::<1>::NAMES.len() as u8 {
+            assert_eq!(Effect::<1>::from_index(index, 1).unwrap().index(), index);
+        }
+    }
+
+    #[test]
+    fn every_typing_reactive_effect_accepts_key_hits() {
+        const LEDS: &[(u8, u8)] = &[(128, 128)];
+        let layout = SliceLayout::new(LEDS);
+        for index in [
+            6,
+            Effect::<1>::CROSSHAIR_INDEX,
+            Effect::<1>::TRACER_INDEX,
+            Effect::<1>::KEYFALL_INDEX,
+            Effect::<1>::SHOCKWAVE_INDEX,
+        ] {
+            let mut effect = Effect::<1>::from_index(index, 1).unwrap();
+            assert!(
+                effect.record_hit(&layout, 0, 0),
+                "effect {index} ignored a hit"
+            );
         }
     }
 

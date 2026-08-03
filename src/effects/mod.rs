@@ -8,20 +8,26 @@ mod crosshair;
 mod cycle;
 mod flow;
 mod gradient;
+mod keyfall;
 mod rain;
 mod reactive;
 mod ripple;
+mod shockwave;
 mod sparkle;
+mod tracer;
 mod vortex;
 
 pub use crosshair::{CrosshairMotion, CrosshairParams, CrosshairState};
 pub use cycle::{Effect, EffectStack};
 pub use flow::FlowState;
 pub use gradient::gradient;
+pub use keyfall::KeyfallState;
 pub use rain::{RainParams, RainState};
 pub use reactive::{Hit, ReactiveState};
 pub use ripple::{Pcg32, RippleState};
+pub use shockwave::ShockwaveState;
 pub use sparkle::SparkleState;
+pub use tracer::TracerState;
 pub use vortex::VortexState;
 
 /// Parameters shared by every effect.

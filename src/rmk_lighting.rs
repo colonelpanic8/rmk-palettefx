@@ -8,8 +8,8 @@
 //! mode/palette/value/speed `LightAction`s ahead of the engine's uniform
 //! background, so `light!(RgbModeForward)`-style keys drive the effects.
 //!
-//! Reactive and Crosshair key hits arrive through a board-owned [`HitQueue`] static: an
-//! event task records LED indices and the source timestamps them in its own
+//! Key-reactive effect hits arrive through a board-owned [`HitQueue`] static:
+//! an event task records LED indices and the source timestamps them in its own
 //! animation-clock domain when it drains them on the next frame tick.
 
 use core::cell::RefCell;
@@ -213,6 +213,9 @@ static EFFECT_PARAMS: [&[ExtensionParamSpec]; EFFECT_COUNT] = [
         .0, // Rain
     &[], // Reactive
     &CROSSHAIR_PARAM_SPECS, // Crosshair
+    &[], // Tracer
+    &[], // Keyfall
+    &[], // Shockwave
 ];
 
 /// Pending key-reactive effect LED indices. `HITS` bounds how many un-drained
