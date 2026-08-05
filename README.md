@@ -21,6 +21,7 @@ they have wired up. This crate is MCU, HAL, and driver agnostic.
 - Tracer
 - Keyfall
 - Shockwave
+- Comet
 
 ### Typing-reactive effects
 
@@ -34,8 +35,33 @@ they have wired up. This crate is MCU, HAL, and driver agnostic.
     next press rather than bending the current ones.
 - **Shockwave** launches an expanding palette-colored ring from each pressed
   key.
+- **Comet** flies a single body to each pressed key instead of lighting it
+  where it was pressed. It arrives late, keeps the speed it had through a
+  redirect so it swings wide of a key it is pulled onto mid-flight, and drags
+  a short trail along the path it flew. Its runtime parameters are:
+  - `Lag x10ms`: time for a flight the full width of the board, which is the
+    lag at its worst. The shared speed control scales it (`128` preserves the
+    configured value).
+  - `Distance pace`: how strongly a hop's distance sets its flight time. `0`
+    gives every flight the same time however far it is, so a hop to the next
+    key over crawls while one across the board tears across it. `255` makes
+    the time follow the square root of the distance: short hops finish
+    quickly and long ones stay bounded by `Lag`. This is what keeps the comet
+    in touch with fast typing -- each press restarts the flight, so a comet
+    that always spent a full lag would drift after a target that keeps moving
+    and fall further behind with every keystroke.
+  - `Momentum`: how much of the in-flight velocity a redirect inherits, out
+    of `128`. `0` stops the comet dead at every press; above `128` it gains
+    speed through a turn and overshoots further.
+  - `Trail x10ms`: how far back along the flown path the trail reaches. `0`
+    leaves a bare head.
+  - `Head size`: radius of the body in board units.
+  - `Linger x10ms`: how long the comet takes to fade out once it has arrived
+    and no further key has been pressed. A press after it has faded starts a
+    new flight at that key rather than dragging the body in from where it
+    died.
 
-All three are sparse and can be selected either as the primary effect or as an
+All four are sparse and can be selected either as the primary effect or as an
 overlay. They use the shared palette, speed, and brightness controls.
 
 ### Crosshair

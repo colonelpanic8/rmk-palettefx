@@ -6,9 +6,9 @@
 //! outgoing effect's state so each effect starts from its own time phase.
 
 use super::{
-    CrosshairParams, CrosshairState, FlowState, FrameParams, KeyfallParams, KeyfallState, Pcg32,
-    RainParams, RainState, ReactiveState, RippleState, ShockwaveState, SparkleState, TracerState,
-    VortexState,
+    CometParams, CometState, CrosshairParams, CrosshairState, FlowState, FrameParams,
+    KeyfallParams, KeyfallState, Pcg32, RainParams, RainState, ReactiveState, RippleState,
+    ShockwaveState, SparkleState, TracerState, VortexState,
 };
 use crate::color::{Hsv, Rgb, blend_rgb, hsv_to_rgb};
 use crate::layout::LedLayout;
@@ -35,12 +35,13 @@ pub enum Effect<const HITS: usize> {
     Tracer(TracerState<HITS>),
     Keyfall(KeyfallState<HITS>),
     Shockwave(ShockwaveState<HITS>),
+    Comet(CometState<HITS>),
 }
 
 impl<const HITS: usize> Effect<HITS> {
     /// Display names in stable index order; `index`/`from_index` and the
     /// next/prev cycle all agree with this ordering.
-    pub const NAMES: [&'static str; 11] = [
+    pub const NAMES: [&'static str; 12] = [
         "Gradient",
         "Flow",
         "Vortex",
@@ -52,6 +53,7 @@ impl<const HITS: usize> Effect<HITS> {
         "Tracer",
         "Keyfall",
         "Shockwave",
+        "Comet",
     ];
 
     /// Stable index of the Flow effect into [`Self::NAMES`].
@@ -69,6 +71,8 @@ impl<const HITS: usize> Effect<HITS> {
     pub const KEYFALL_INDEX: u8 = 9;
     /// Stable index of the Shockwave effect into [`Self::NAMES`].
     pub const SHOCKWAVE_INDEX: u8 = 10;
+    /// Stable index of the Comet effect into [`Self::NAMES`].
+    pub const COMET_INDEX: u8 = 11;
 
     /// Whether the effect at `index` renders a [`RainState`], and therefore
     /// exposes the [`RainParams`] tuning.
@@ -84,6 +88,11 @@ impl<const HITS: usize> Effect<HITS> {
     /// Whether the effect at `index` exposes [`KeyfallParams`].
     pub const fn uses_keyfall_params(index: u8) -> bool {
         index == Self::KEYFALL_INDEX
+    }
+
+    /// Whether the effect at `index` exposes [`CometParams`].
+    pub const fn uses_comet_params(index: u8) -> bool {
+        index == Self::COMET_INDEX
     }
 
     /// Retune the rain of whichever variant owns a [`RainState`]; a no-op
@@ -134,6 +143,21 @@ impl<const HITS: usize> Effect<HITS> {
         }
     }
 
+    /// Retune Comet; a no-op for every other effect.
+    pub const fn set_comet_params(&mut self, params: CometParams) {
+        if let Self::Comet(state) = self {
+            state.set_params(params);
+        }
+    }
+
+    /// Comet tuning, or `None` for every other effect.
+    pub const fn comet_params(&self) -> Option<CometParams> {
+        match self {
+            Self::Comet(state) => Some(state.params()),
+            _ => None,
+        }
+    }
+
     /// Stable index of the active effect into [`Self::NAMES`].
     pub const fn index(&self) -> u8 {
         match self {
@@ -148,6 +172,7 @@ impl<const HITS: usize> Effect<HITS> {
             Self::Tracer(_) => 8,
             Self::Keyfall(_) => 9,
             Self::Shockwave(_) => 10,
+            Self::Comet(_) => 11,
         }
     }
 
@@ -166,6 +191,7 @@ impl<const HITS: usize> Effect<HITS> {
             8 => Self::Tracer(TracerState::new()),
             9 => Self::Keyfall(KeyfallState::new()),
             10 => Self::Shockwave(ShockwaveState::new()),
+            11 => Self::Comet(CometState::new()),
             _ => return None,
         })
     }
@@ -184,6 +210,7 @@ impl<const HITS: usize> Effect<HITS> {
             Self::Tracer(s) => s.tick(layout, params, out),
             Self::Keyfall(s) => s.tick(layout, params, out),
             Self::Shockwave(s) => s.tick(layout, params, out),
+            Self::Comet(s) => s.tick(layout, params, out),
         }
     }
 
@@ -202,6 +229,7 @@ impl<const HITS: usize> Effect<HITS> {
             Self::Tracer(state) => state.tick_layer(layout, params, out),
             Self::Keyfall(state) => state.tick_layer(layout, params, out),
             Self::Shockwave(state) => state.tick_layer(layout, params, out),
+            Self::Comet(state) => state.tick_layer(layout, params, out),
             _ => self.tick(layout, params, out),
         }
     }
@@ -221,14 +249,16 @@ impl<const HITS: usize> Effect<HITS> {
             Self::Crosshair(_) => Self::Tracer(TracerState::new()),
             Self::Tracer(_) => Self::Keyfall(KeyfallState::new()),
             Self::Keyfall(_) => Self::Shockwave(ShockwaveState::new()),
-            Self::Shockwave(_) => Self::Gradient,
+            Self::Shockwave(_) => Self::Comet(CometState::new()),
+            Self::Comet(_) => Self::Gradient,
         };
     }
 
     /// Switch to the previous effect in the cycle; see [`Effect::next`].
     pub fn prev(&mut self, ripple_seed: u64) {
         *self = match self {
-            Self::Gradient => Self::Shockwave(ShockwaveState::new()),
+            Self::Gradient => Self::Comet(CometState::new()),
+            Self::Comet(_) => Self::Shockwave(ShockwaveState::new()),
             Self::Shockwave(_) => Self::Keyfall(KeyfallState::new()),
             Self::Keyfall(_) => Self::Tracer(TracerState::new()),
             Self::Tracer(_) => Self::Crosshair(CrosshairState::new()),
@@ -253,6 +283,7 @@ impl<const HITS: usize> Effect<HITS> {
             Self::Tracer(state) => state.record_hit(x, y, timer_ms),
             Self::Keyfall(state) => state.record_hit(layout, x, y, timer_ms),
             Self::Shockwave(state) => state.record_hit(layout, x, y, timer_ms),
+            Self::Comet(state) => state.record_hit(x, y, timer_ms),
             _ => return false,
         }
         true
@@ -381,6 +412,10 @@ mod tests {
             Effect::<1>::NAMES[Effect::<1>::SHOCKWAVE_INDEX as usize],
             "Shockwave"
         );
+        assert_eq!(
+            Effect::<1>::NAMES[Effect::<1>::COMET_INDEX as usize],
+            "Comet"
+        );
         for index in 0..Effect::<1>::NAMES.len() as u8 {
             assert_eq!(Effect::<1>::from_index(index, 1).unwrap().index(), index);
         }
@@ -396,6 +431,7 @@ mod tests {
             Effect::<1>::TRACER_INDEX,
             Effect::<1>::KEYFALL_INDEX,
             Effect::<1>::SHOCKWAVE_INDEX,
+            Effect::<1>::COMET_INDEX,
         ] {
             let mut effect = Effect::<1>::from_index(index, 1).unwrap();
             assert!(

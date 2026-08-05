@@ -24,7 +24,8 @@
 //! - [`layout`]: [`LedLayout`](layout::LedLayout) trait describing the
 //!   (x, y) position of each LED in 0..=255 space.
 //! - [`effects`]: the PaletteFx effects (Gradient, Flow, Ripple, Sparkle,
-//!   Vortex, Rain, Reactive, Crosshair, Tracer, Keyfall, Shockwave). Stateful
+//!   Vortex, Rain, Reactive, Crosshair, Tracer, Keyfall, Shockwave, Comet).
+//!   Stateful
 //!   effects (all but Gradient) carry their state in a struct; Gradient is a
 //!   free function.
 //!

@@ -28,7 +28,8 @@ use rmk::lighting::topology::LightingTopology;
 
 use crate::color::{Hsv, Rgb};
 use crate::effects::{
-    CrosshairParams, Effect, EffectStack, FlowState, FrameParams, KeyfallParams, RainParams,
+    CometParams, CrosshairParams, Effect, EffectStack, FlowState, FrameParams, KeyfallParams,
+    RainParams,
 };
 use crate::layout::LedLayout;
 use crate::palette::{BUILTIN_PALETTE_NAMES, BUILTIN_PALETTES};
@@ -164,6 +165,7 @@ static CROSSHAIR_PARAM_SPECS: [ExtensionParamSpec; CrosshairParams::COUNT as usi
     crosshair_param_specs();
 static KEYFALL_PARAM_SPECS: [ExtensionParamSpec; KeyfallParams::COUNT as usize] =
     keyfall_param_specs();
+static COMET_PARAM_SPECS: [ExtensionParamSpec; CometParams::COUNT as usize] = comet_param_specs();
 
 const fn rain_param_specs() -> [ExtensionParamSpec; RainParams::COUNT as usize] {
     let mut specs = [ExtensionParamSpec {
@@ -225,6 +227,26 @@ const fn keyfall_param_specs() -> [ExtensionParamSpec; KeyfallParams::COUNT as u
     specs
 }
 
+const fn comet_param_specs() -> [ExtensionParamSpec; CometParams::COUNT as usize] {
+    let mut specs = [ExtensionParamSpec {
+        name: "",
+        min: 0,
+        max: 0,
+        default: 0,
+    }; CometParams::COUNT as usize];
+    let mut i = 0;
+    while i < specs.len() {
+        specs[i] = ExtensionParamSpec {
+            name: CometParams::NAMES[i],
+            min: CometParams::MINS[i],
+            max: CometParams::MAXES[i],
+            default: CometParams::DEFAULTS[i],
+        };
+        i += 1;
+    }
+    specs
+}
+
 /// Per-effect parameter rows, indexed exactly like `Effect::NAMES`.
 static EFFECT_PARAMS: [&[ExtensionParamSpec]; EFFECT_COUNT] = [
     &[], // Gradient
@@ -240,6 +262,7 @@ static EFFECT_PARAMS: [&[ExtensionParamSpec]; EFFECT_COUNT] = [
     &[], // Tracer
     &KEYFALL_PARAM_SPECS, // Keyfall
     &[], // Shockwave
+    &COMET_PARAM_SPECS, // Comet
 ];
 
 /// Pending key-reactive effect LED indices. `HITS` bounds how many un-drained
@@ -285,6 +308,7 @@ pub struct PaletteFxSource<L: LedLayout, const N: usize, const HITS: usize = 16>
     rain_params: [RainParams; EFFECT_COUNT],
     crosshair_params: [CrosshairParams; EFFECT_COUNT],
     keyfall_params: [KeyfallParams; EFFECT_COUNT],
+    comet_params: [CometParams; EFFECT_COUNT],
     scratch: [Hsv; N],
     frame: [Rgb; N],
     last_now_ms: u64,
@@ -311,6 +335,7 @@ impl<L: LedLayout, const N: usize, const HITS: usize> PaletteFxSource<L, N, HITS
         let mut rain_params = [RainParams::DEFAULT; EFFECT_COUNT];
         let mut crosshair_params = [CrosshairParams::DEFAULT; EFFECT_COUNT];
         let mut keyfall_params = [KeyfallParams::DEFAULT; EFFECT_COUNT];
+        let mut comet_params = [CometParams::DEFAULT; EFFECT_COUNT];
         for (slot, values, len) in [
             (
                 Some(primary_index),
@@ -354,6 +379,16 @@ impl<L: LedLayout, const N: usize, const HITS: usize> PaletteFxSource<L, N, HITS
                     },
                 );
             }
+            if Effect::<HITS>::uses_comet_params(index) {
+                restore_params(
+                    comet_params.get_mut(index as usize),
+                    values,
+                    len,
+                    |row, i, v| {
+                        row.set(i, v);
+                    },
+                );
+            }
         }
 
         let mut source = Self {
@@ -372,6 +407,7 @@ impl<L: LedLayout, const N: usize, const HITS: usize> PaletteFxSource<L, N, HITS
             rain_params,
             crosshair_params,
             keyfall_params,
+            comet_params,
             scratch: [Hsv::default(); N],
             frame: [Rgb::default(); N],
             last_now_ms: 0,
@@ -389,6 +425,7 @@ impl<L: LedLayout, const N: usize, const HITS: usize> PaletteFxSource<L, N, HITS
             &self.rain_params,
             &self.crosshair_params,
             &self.keyfall_params,
+            &self.comet_params,
         );
         if let Some(overlay) = self.effects.overlay_mut() {
             sync_effect_params(
@@ -396,6 +433,7 @@ impl<L: LedLayout, const N: usize, const HITS: usize> PaletteFxSource<L, N, HITS
                 &self.rain_params,
                 &self.crosshair_params,
                 &self.keyfall_params,
+                &self.comet_params,
             );
         }
     }
@@ -568,6 +606,8 @@ impl<L: LedLayout, const N: usize, const HITS: usize, Context> LightingSource<Rg
             self.crosshair_params.get(effect as usize)?.get(index)
         } else if Effect::<HITS>::uses_keyfall_params(effect) {
             self.keyfall_params.get(effect as usize)?.get(index)
+        } else if Effect::<HITS>::uses_comet_params(effect) {
+            self.comet_params.get(effect as usize)?.get(index)
         } else {
             None
         }
@@ -588,6 +628,10 @@ impl<L: LedLayout, const N: usize, const HITS: usize, Context> LightingSource<Rg
             self.keyfall_params
                 .get_mut(effect as usize)
                 .is_some_and(|params| params.set(index, value))
+        } else if Effect::<HITS>::uses_comet_params(effect) {
+            self.comet_params
+                .get_mut(effect as usize)
+                .is_some_and(|params| params.set(index, value))
         } else {
             false
         };
@@ -600,6 +644,7 @@ impl<L: LedLayout, const N: usize, const HITS: usize, Context> LightingSource<Rg
                 &self.rain_params,
                 &self.crosshair_params,
                 &self.keyfall_params,
+                &self.comet_params,
             );
         }
         if self
@@ -612,6 +657,7 @@ impl<L: LedLayout, const N: usize, const HITS: usize, Context> LightingSource<Rg
                 &self.rain_params,
                 &self.crosshair_params,
                 &self.keyfall_params,
+                &self.comet_params,
             );
         }
         true
@@ -638,6 +684,7 @@ fn sync_effect_params<const HITS: usize>(
     rain_params: &[RainParams; EFFECT_COUNT],
     crosshair_params: &[CrosshairParams; EFFECT_COUNT],
     keyfall_params: &[KeyfallParams; EFFECT_COUNT],
+    comet_params: &[CometParams; EFFECT_COUNT],
 ) {
     let index = effect.index() as usize;
     if let Some(&params) = rain_params.get(index) {
@@ -648,6 +695,9 @@ fn sync_effect_params<const HITS: usize>(
     }
     if let Some(&params) = keyfall_params.get(index) {
         effect.set_keyfall_params(params);
+    }
+    if let Some(&params) = comet_params.get(index) {
+        effect.set_comet_params(params);
     }
 }
 
@@ -739,7 +789,8 @@ mod tests {
                 !specs.is_empty(),
                 Effect::<1>::uses_rain_params(effect)
                     || Effect::<1>::uses_crosshair_params(effect)
-                    || Effect::<1>::uses_keyfall_params(effect),
+                    || Effect::<1>::uses_keyfall_params(effect)
+                    || Effect::<1>::uses_comet_params(effect),
                 "effect {effect} parameter row disagrees with its state"
             );
         }
@@ -832,6 +883,65 @@ mod tests {
                 Some(spec.default),
             );
         }
+    }
+
+    #[test]
+    fn comet_parameters_advertise_and_read_back_their_defaults() {
+        let source = reactive(&NO_HITS);
+        let descriptor =
+            <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::extension_descriptor(&source)
+                .unwrap();
+        let effect = Effect::<1>::COMET_INDEX;
+        let specs = descriptor.effect_params(effect).unwrap();
+        assert_eq!(specs.len(), CometParams::COUNT as usize);
+        for (index, spec) in specs.iter().enumerate() {
+            assert_eq!(spec.name, CometParams::NAMES[index]);
+            assert_eq!(spec.min, CometParams::MINS[index]);
+            assert_eq!(spec.max, CometParams::MAXES[index]);
+            assert_eq!(spec.default, CometParams::DEFAULTS[index]);
+            assert_eq!(
+                <PaletteFxSource<_, 1, 1> as LightingSource<Rgb8, ()>>::extension_param(
+                    &source,
+                    effect,
+                    index as u8,
+                ),
+                Some(spec.default),
+            );
+        }
+    }
+
+    /// Comet's whole row has to survive a persisted record, since six
+    /// parameters is the widest row an effect carries after Crosshair's.
+    #[test]
+    fn restored_comet_tuning_is_applied_at_boot() {
+        let tuning = CometParams {
+            lag: 40,
+            pace: 90,
+            momentum: 96,
+            trail: 60,
+            head: 20,
+            linger: 150,
+        };
+        let source: PaletteFxSource<_, 1, 1> = PaletteFxSource::new(
+            SliceLayout::new(&POSITIONS),
+            &NO_HITS,
+            PaletteFxConfig {
+                initial_effect: Effect::<1>::COMET_INDEX,
+                initial_params: [
+                    tuning.lag,
+                    tuning.pace,
+                    tuning.momentum,
+                    tuning.trail,
+                    tuning.head,
+                    tuning.linger,
+                    0,
+                    0,
+                ],
+                initial_param_len: CometParams::COUNT,
+                ..PaletteFxConfig::default()
+            },
+        );
+        assert_eq!(source.effects.primary().comet_params(), Some(tuning));
     }
 
     #[test]

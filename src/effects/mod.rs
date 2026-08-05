@@ -4,6 +4,7 @@
 
 use crate::palette::Palette;
 
+mod comet;
 mod crosshair;
 mod cycle;
 mod flow;
@@ -17,6 +18,7 @@ mod sparkle;
 mod tracer;
 mod vortex;
 
+pub use comet::{CometParams, CometState};
 pub use crosshair::{CrosshairMotion, CrosshairParams, CrosshairState};
 pub use cycle::{Effect, EffectStack};
 pub use flow::FlowState;
