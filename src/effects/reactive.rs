@@ -113,9 +113,7 @@ impl<const N: usize> ReactiveState<N> {
             let value = self.value_at(&hit_amplitude, lx, ly);
 
             let mut hsv = interp_color(params.palette, value, params.sat, params.val);
-            if value < 32 {
-                hsv.v = scale8(hsv.v, 64 + 6 * value);
-            }
+            hsv.v = scale8(hsv.v, value);
             *slot = hsv;
         }
     }
@@ -146,5 +144,43 @@ fn reactive_amplitude(t: u8) -> u8 {
     } else {
         let u = (((255 - t) as u16) * 164) >> 7;
         scale8(u as u8, u as u8)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::SliceLayout;
+    use crate::palette::hsv16;
+
+    const PALETTE: [u16; 16] = [hsv16(0, 255, 255); 16];
+    const POSITIONS: &[(u8, u8)] = &[(128, 128), (200, 200)];
+
+    fn frame(timer_ms: u32) -> FrameParams<'static> {
+        FrameParams {
+            palette: &PALETTE,
+            speed: 0,
+            sat: 255,
+            val: 255,
+            timer_ms,
+        }
+    }
+
+    #[test]
+    fn idle_and_expired_frames_have_no_background() {
+        let layout = SliceLayout::new(POSITIONS);
+        let mut state = ReactiveState::<1>::new();
+        let mut out = [Hsv::new(1, 2, 3); POSITIONS.len()];
+
+        state.tick(&layout, frame(0), &mut out);
+        assert!(out.iter().all(|pixel| pixel.v == 0));
+
+        state.record_hit(128, 128, 0);
+        state.tick(&layout, frame(1), &mut out);
+        assert!(out[0].v > 0);
+        assert_eq!(out[1].v, 0);
+
+        state.tick(&layout, frame(100_000), &mut out);
+        assert!(out.iter().all(|pixel| pixel.v == 0));
     }
 }
